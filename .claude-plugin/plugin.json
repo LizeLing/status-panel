@@ -1,0 +1,14 @@
+{
+  "name": "status-panel",
+  "version": "0.1.0",
+  "description": "Shows the status line's figures (location, model, context, rate limits) in a side pane",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "openWith": {
+      "title": "[열기]로 여는 앱",
+      "description": "하네스 탭의 [열기]가 파일을 여는 앱의 이름(예: Visual Studio Code). 비워 두면 macOS 기본 앱으로 엽니다.",
+      "type": "string",
+      "default": ""
+    }
+  }
+}

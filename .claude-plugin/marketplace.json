@@ -1,0 +1,5 @@
+{
+  "name": "lizeling-mods",
+  "owner": { "name": "LizeLing" },
+  "plugins": [{ "name": "status-panel", "source": "./" }]
+}
