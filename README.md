@@ -34,7 +34,9 @@ claude plugin install status-panel --marketplace LizeLing/status-panel
 
 ### 상태
 
-대화 옆에 늘 띄워 두는 첫 화면입니다(맨 위 스크린숏).
+<img src="docs/screenshots/status-tab.png" width="340" alt="상태 탭">
+
+대화 옆에 늘 띄워 두는 첫 화면입니다.
 
 - 로그인한 계정과 요금제, 작업 폴더와 브랜치, 모델 · effort · Claude Code 버전을 보여 줍니다.
 - 세션 시간, 보낸 프롬프트 수, 비용, 세션 ID 를 보여 줍니다.
@@ -42,16 +44,23 @@ claude plugin install status-panel --marketplace LizeLing/status-panel
 - **컨텍스트**: 컨텍스트 창을 얼마나 썼는지와, `/context` 처럼 시스템 프롬프트 · 도구 · 에이전트 · 메모리 파일 · 스킬 같은 항목별 토큰 수를 보여 줍니다.
 - 아래쪽에는 큰 시계와 오늘 날짜가 나옵니다.
 
-### Git · 달력
+### Git
 
-<img src="docs/screenshots/git.png" width="330" alt="Git 탭"> <img src="docs/screenshots/calendar.png" width="330" alt="달력 탭">
+<img src="docs/screenshots/git.png" width="340" alt="Git 탭">
 
-- **Git**: 스테이징 · 수정 · 새 파일 수와 추가 · 삭제한 줄 수, 원격 브랜치보다 앞서거나 뒤처진 커밋 수를 보여 줍니다. 이어서 브랜치 목록, 최근 커밋, 변경된 파일(`M` 수정 · `??` 새 파일 등)을 나열합니다.
-- **달력**: 이번 달 달력에 오늘을 표시하고, 주간 사용량 한도가 초기화되는 날과 시각을 함께 표시합니다.
+- 스테이징 · 수정 · 새 파일 수와 추가 · 삭제한 줄 수, 원격 브랜치보다 앞서거나 뒤처진 커밋 수를 보여 줍니다.
+- 이어서 브랜치 목록, 최근 커밋, 변경된 파일(`M` 수정 · `??` 새 파일 등)을 나열합니다.
+
+### 달력
+
+<img src="docs/screenshots/calendar.png" width="340" alt="달력 탭">
+
+- 이번 달 달력에 오늘을 표시합니다.
+- 주간 사용량 한도가 초기화되는 날을 달력에 표시하고, 그 날짜와 시각을 아래에 적습니다.
 
 ### 하네스
 
-<img src="docs/screenshots/harness.png" width="330" alt="하네스 탭">
+<img src="docs/screenshots/harness.png" width="340" alt="하네스 탭">
 
 `~/.claude`(글로벌)와 프로젝트(로컬)에 설정된 하네스를 종류별로 봅니다.
 
@@ -63,7 +72,7 @@ claude plugin install status-panel --marketplace LizeLing/status-panel
 
 ### 뉴스
 
-<img src="docs/screenshots/news.png" width="330" alt="뉴스 탭">
+<img src="docs/screenshots/news.png" width="340" alt="뉴스 탭">
 
 - GeekNews · 인벤 · AI타임스 · GitHub 트렌딩 · claude.dev 블로그를 골라 최신 글을 10개씩 넘겨 봅니다. 글마다 올라온 지 얼마나 지났는지 함께 적습니다.
 - GitHub 트렌딩은 저장소 이름, 오늘 받은 별 수, 설명을 두 줄로 보여 줍니다.
@@ -71,7 +80,7 @@ claude plugin install status-panel --marketplace LizeLing/status-panel
 
 ### 파일
 
-<img src="docs/screenshots/files.png" width="330" alt="파일 탭">
+<img src="docs/screenshots/files.png" width="340" alt="파일 탭">
 
 - 프로젝트의 파일을 트리로 보여 줍니다. 폴더를 누르면 펼치거나 접습니다.
 - 에이전트가 이 세션에서 만들고(`C`) · 읽고(`R`) · 고치고(`U`) · 지운(`D`) 파일에 표시를 붙입니다. Bash 명령으로 바뀐 파일도 명령 전후를 비교해 찾아냅니다.
@@ -79,13 +88,13 @@ claude plugin install status-panel --marketplace LizeLing/status-panel
 
 ### 문서
 
-<img src="docs/screenshots/docs-page.png" width="330" alt="문서 탭의 본문"> <img src="docs/screenshots/docs-toc.png" width="330" alt="문서 탭의 목차">
+<img src="docs/screenshots/docs-page.png" width="340" alt="문서 탭">
 
 [Claude Code 한국어 문서](https://code.claude.com/docs/ko/overview)를 패널 안에서 읽습니다.
 
 - 위쪽에는 사이트의 섹션(시작하기 · Claude Code로 만들기 · 플러그인 · 관리 · 구성 · 레퍼런스 · Agent SDK · 새로운 기능 · 리소스)이 탭으로 나오고, 고른 섹션의 페이지가 그룹 제목 아래에 12줄씩 나옵니다.
 - 페이지를 누르면 아래에 제목과 한 줄 설명이 나오고, 본문을 Markdown 으로 그립니다. 긴 페이지는 `##` 제목마다, 그리고 약 2400자마다 나눠 「◂ 이전 · 다음 ▸」로 넘깁니다.
-- `목차` 를 누르면 페이지의 제목 목록이 나오고(오른쪽 스크린숏), 제목을 누르면 그 부분으로 바로 넘어갑니다.
+- `목차` 를 누르면 본문 자리에 페이지의 제목 목록이 나오고, 제목을 누르면 그 부분으로 바로 넘어갑니다.
 - 본문에 있는 다른 문서 링크를 누르면 브라우저 대신 패널 안에서 그 문서로 넘어갑니다.
 - `[열기]` 는 브라우저로 페이지를 열고, `[세션에 넣기]` 는 페이지 주소를 프롬프트 입력란에 넣습니다. 변경 로그처럼 사이트 밖에 있는 문서는 `[열기]` 로 봅니다.
 - 본문이 패널보다 길면 패널에 포커스를 옮긴 뒤 화살표 키나 휠로 스크롤합니다.
