@@ -96,6 +96,44 @@ export type Files = { root: string; paths: string[]; isPartial: boolean }
 // opened, the file picked, and the page shown.
 export type FileView = { filter: string; open: string[]; picked: string; page: number }
 
+// An article of a news feed: its title, link, summary (cut short) and when it
+// came out, as epoch milliseconds (NaN where the feed gave no date it reads).
+// A trending repository has no date: `aside` stands where the age would (the
+// stars of the day), and `meta` heads its details.
+export type Article = { title: string; link: string; summary: string; at: number; aside?: string; meta?: string }
+
+// A feed as last read: its articles, when it was read, and what went wrong
+// the last time (empty when nothing did).
+export type Feed = { articles: Article[]; readAt: number; error: string }
+
+// How the news tab stands: the source shown, its page, and the article picked
+// (by its link).
+export type NewsView = { source: string; page: number; picked: string }
+
+// A page of the Korean documentation as its index lists it: where it is under
+// code.claude.com/docs/ko, its title and the line under it.
+export type DocPage = { slug: string; title: string; about: string }
+
+// A group of pages in a section, a group under another named by both.
+export type DocGroup = { name: string; pages: DocPage[] }
+
+// A section of the documentation, as the site's tabs divide it.
+export type DocSection = { name: string; groups: DocGroup[] }
+
+// The documentation's index as last read, as a feed is.
+export type DocIndex = { sections: DocSection[]; readAt: number; error: string }
+
+// A stretch of a page's text: what is under one heading, or a piece of it
+// where that is long; `heading` is the heading it is under.
+export type DocPart = { heading: string; text: string }
+
+// A page's text as last read, in parts.
+export type DocText = { title: string; parts: DocPart[]; readAt: number; error: string }
+
+// How the docs tab stands: the section shown, the page of its list, the page
+// picked, the part of it shown, and whether its headings are listed instead.
+export type DocView = { section: number; page: number; picked: string; part: number; isToc: boolean }
+
 export type Info = {
   cwd: string
   branch: string
@@ -119,6 +157,6 @@ export type Info = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'status-panel': { info: Info | null; tab: string; activity: Activity; scope: string; kind: string; page: number; detail: Detail | null; used: Used; files: Files | null; touched: Record<string, FileOp[]>; fileView: FileView }
+    'status-panel': { info: Info | null; tab: string; activity: Activity; scope: string; kind: string; page: number; detail: Detail | null; used: Used; files: Files | null; touched: Record<string, FileOp[]>; fileView: FileView; news: Record<string, Feed>; newsView: NewsView; docIndex: DocIndex | null; docTexts: Record<string, DocText>; docView: DocView }
   }
 }

@@ -993,3 +993,348 @@ test('the files tab lists the project as a tree and marks what the agent made, r
   await ui.press({ key: 'tab-tab1' })
   await ui.unmount()
 })
+
+test('the news tab reads each source as it is shown, lists its articles and opens the one picked', async ($, on) => {
+  const now = Date.parse('2026-10-18T17:42:00+09:00')
+  world(on, 38, LIMITS, now)
+  const asked: string[] = []
+  const opened: string[][] = []
+  const FEEDS: Record<string, { status: number; text: string }> = {
+    'https://news.hada.io/rss/news': {
+      status: 200,
+      text: `<?xml version='1.0'?><feed xmlns='http://www.w3.org/2005/Atom'><title>GeekNews</title>
+<entry><title><![CDATA[Show GN: 개당 — 단위가격 비교]]></title><link rel='alternate' type='text/html' href='https://news.hada.io/topic?id=1' />
+<updated>2026-10-18T17:34:56+09:00</updated><content type='html'><![CDATA[<p>생수 12병과 <strong>24병</strong> &amp; 비교</p>]]></content></entry><entry>
+</entry><entry><title>Second</title><link href="https://news.hada.io/topic?id=2"/><updated>2026-10-18T14:10:00+09:00</updated></entry></feed>`,
+    },
+    'https://webzine.inven.co.kr/news/rss.php': { status: 500, text: '' },
+    'https://www.aitimes.com/rss/allArticle.xml': {
+      status: 200,
+      text: `<rss version="2.0"><channel><title>AI타임스</title>
+<item><title>리퀴드 AI, &apos;d1-울트라&apos; 공개</title><link>https://www.aitimes.com/news/articleView.html?idxno=216371&amp;x=1</link>
+<description>&lt;p&gt;리퀴드 AI가 모델을 공개했다.&lt;/p&gt;</description><pubDate>2026-10-18 17:13:21</pubDate></item>
+<item><title>구글 양자컴퓨터</title><link>https://www.aitimes.com/news/articleView.html?idxno=2</link><pubDate>Sat, 17 Oct 2026 16:40:31 +0900</pubDate></item>
+</channel></rss>`,
+    },
+  }
+  on('http.fetch', (_, e) => {
+    asked.push(e.url)
+    const feed = FEEDS[e.url] ?? { status: 404, text: '' }
+
+    return { value: { status: feed.status, ok: feed.status === 200, headers: {}, text: feed.text } }
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'open') {
+      opened.push([...e.argv])
+    }
+
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.command.run(RUN)
+  // As wide as the pane opens.
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 41 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+  const labels = async () => (await ui.findAll({ type: 'Button' })).map(one => String(one.props.label).trim())
+
+  // The tab sits left of the files, and reads GeekNews first.
+  expect(asked).toEqual([])
+  await ui.press({ key: 'tab-tab8' })
+  expect(await ui.find({ key: 'news-claudedev' })).toBeDefined()
+  expect(asked).toEqual(['https://news.hada.io/rss/news'])
+  expect(await texts()).toEqual(expect.arrayContaining(['GeekNews', '2개 · 17:42 읽음', '7분', '3시간', '1/1', '위에서 기사를 고르세요.']))
+  expect(await labels()).toEqual(expect.arrayContaining(['Show GN: 개당 — 단위가격 비교', 'Second', '새로고침']))
+
+  // 새로고침 asks again.
+  await ui.press({ key: 'news-refresh' })
+  expect(asked).toHaveLength(2)
+
+  // An article's details: its title, summary as words, and an open button.
+  await ui.press({ key: 'news-geeknews-0' })
+  expect(await texts()).toEqual(expect.arrayContaining(['세부 내용', 'GeekNews · 10/18 17:34', '생수 12병과 24병 & 비교', 'news.hada.io']))
+  await ui.press({ key: 'news-open' })
+  expect(opened).toEqual([['open', 'https://news.hada.io/topic?id=1']])
+
+  // A feed that fails says so; another source keeps its own.
+  await ui.press({ key: 'news-inven' })
+  expect(await texts()).toContain('피드를 읽지 못했습니다(HTTP 500).')
+  await ui.press({ key: 'news-aitimes' })
+  expect(await texts()).toEqual(expect.arrayContaining(['28분', '1일', '위에서 기사를 고르세요.']))
+  await ui.press({ key: 'news-aitimes-0' })
+  expect(await texts()).toEqual(expect.arrayContaining(["리퀴드 AI, 'd1-울트라' 공개", '리퀴드 AI가 모델을 공개했다.', 'aitimes.com']))
+  await ui.press({ key: 'news-open' })
+  expect(opened[1]).toEqual(['open', 'https://www.aitimes.com/news/articleView.html?idxno=216371&x=1'])
+
+  // A feed read within the last minutes is not asked for again, nor its pick kept.
+  await ui.press({ key: 'news-geeknews' })
+  expect(asked).toHaveLength(4)
+  expect(await texts()).toContain('위에서 기사를 고르세요.')
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+test('GitHub trending lists each repository in two rows with its own words, and puts its address in the prompt', async ($, on) => {
+  world(on, 38, LIMITS, Date.parse('2026-10-18T17:42:00+09:00'))
+  const asked: string[] = []
+  const filled: string[] = []
+  const repo = (name: string, words: string, today: string) => `<article class="Box-row">
+  <h2 class="h3 lh-condensed"><a href="/${name}" class="Link">${name}</a></h2>
+  ${words === '' ? '' : `<p class="col-9 color-fg-muted my-1 tmp-pr-4">\n      ${words}\n    </p>`}
+  <div class="f6"><span itemprop="programmingLanguage">TypeScript</span>
+  <a href="/${name}/stargazers"><svg class="octicon"></svg>
+        95,792</a>
+  <span class="d-inline-block float-sm-right">${today} stars today</span></div>
+</article>`
+  on('http.fetch', (_, e) => {
+    asked.push(e.url)
+
+    if (e.url === 'https://github.com/trending') {
+      return {
+        value: {
+          status: 200,
+          ok: true,
+          headers: {},
+          text: `<html>${repo('stablyai/orca', 'Orca is the place for working with a fleet of agents &amp; more.', '1,830')}${repo('android/skills', '', '355')}</html>`,
+        },
+      }
+    }
+
+    return { value: { status: 404, ok: false, headers: {}, text: '' } }
+  })
+  on('prompt.fill', (_, e) => {
+    filled.push(e.text)
+
+    return { isFilled: true, text: e.text, cursor: e.text.length }
+  })
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 41 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+
+  await ui.press({ key: 'tab-tab8' })
+  await ui.press({ key: 'news-github' })
+  expect(asked).toEqual(['https://news.hada.io/rss/news', 'https://github.com/trending'])
+  expect(await texts()).toEqual(expect.arrayContaining(['GitHub 트렌딩', '2개 · 17:42 읽음', '+1.8k', '+355', '(설명 없음)']))
+
+  // Its details: language and stars over its words.
+  await ui.press({ key: 'news-github-0' })
+  expect(await texts()).toEqual(
+    expect.arrayContaining([
+      'TypeScript · ★95,792 · 오늘 +1,830',
+      'stablyai/orca',
+      'Orca is the place for working with a',
+      'fleet of agents & more.',
+    ]),
+  )
+  await ui.press({ key: 'news-send' })
+  expect(filled).toEqual(['https://github.com/stablyai/orca '])
+
+  // A read within the last minutes is not asked for again.
+  await ui.press({ key: 'news-geeknews' })
+  await ui.press({ key: 'news-github' })
+  expect(asked.filter(url => url !== 'https://news.hada.io/rss/news')).toHaveLength(1)
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+// The Korean documentation's index as the site gives it, and two of its pages.
+const DOCS_INDEX = `# Claude Code Docs: Korean
+
+## Korean
+
+### 시작하기
+
+#### 시작하기
+
+- [개요](https://code.claude.com/docs/ko/overview.md): Claude Code는 에이전트 코딩 도구입니다.
+- [변경 로그](https://code.claude.com/docs/ko/changelog.md)
+
+#### 플랫폼 및 통합
+
+- [VS Code에서 Claude Code 사용하기](https://code.claude.com/docs/ko/vs-code.md): VS Code 확장을 설치합니다.
+
+##### 데스크톱용 Claude Code
+
+- [데스크톱 앱 시작하기](https://code.claude.com/docs/ko/desktop-quickstart.md): 데스크톱 앱을 설치합니다.
+
+### 플러그인
+
+#### 플러그인
+
+- [플러그인](https://code.claude.com/docs/ko/plugins/overview.md): 플러그인으로 Claude Code를 확장합니다.
+- [개요](https://code.claude.com/docs/ko/overview.md): 다시 나온 페이지
+
+### 리소스
+
+### 새로운 기능
+
+- [Week 22](https://code.claude.com/docs/ko/whats-new/2026-w22.md): 이번 주의 변경 사항
+`
+
+const OVERVIEW = `> ## Documentation Index
+> Fetch the complete documentation index at: https://code.claude.com/docs/llms.txt
+
+# 개요
+
+> Claude Code는 에이전트 코딩 도구입니다.
+
+Claude Code는 [VS Code](/docs/ko/vs-code)와 [터미널](https://example.com/terminal)에서 씁니다.
+
+## 시작하기
+
+\`\`\`bash theme={null}
+curl -fsSL https://claude.ai/install.sh | bash
+\`\`\`
+
+> [!NOTE]
+>
+> 기본 설치는 자동으로 업데이트됩니다.
+
+## 다음 단계
+
+${Array.from({ length: 40 }, (_, at) => `다음 단계의 문단 ${at + 1}입니다. ${'설명이 이어집니다. '.repeat(6)}`).join('\n\n')}
+`
+
+const VS_CODE = `# VS Code에서 Claude Code 사용하기
+
+> VS Code 확장을 설치합니다.
+
+확장을 설치합니다.
+`
+
+test('the docs tab lists the Korean documentation by section and shows the page picked in parts', async ($, on) => {
+  world(on, 38, LIMITS, Date.parse('2026-10-22T19:20:00+09:00'))
+  const asked: string[] = []
+  const opened: string[][] = []
+  const filled: string[] = []
+  on('http.fetch', (_, e) => {
+    asked.push(e.url)
+    const pages: Record<string, string> = {
+      'https://code.claude.com/docs/_llms/ko.txt': DOCS_INDEX,
+      'https://code.claude.com/docs/ko/overview.md': OVERVIEW,
+      'https://code.claude.com/docs/ko/vs-code.md': VS_CODE,
+      'https://code.claude.com/docs/ko/changelog.md': '<!DOCTYPE html>\n<html lang="en"></html>',
+    }
+    const text = pages[e.url]
+
+    return text === undefined
+      ? { value: { status: 404, ok: false, headers: {}, text: '' } }
+      : { value: { status: 200, ok: true, headers: {}, text } }
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'open') {
+      opened.push([...e.argv])
+    }
+
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('prompt.fill', (_, e) => {
+    filled.push(e.text)
+
+    return { isFilled: true, text: e.text, cursor: e.text.length }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+  const body = async () => (await ui.find({ key: 'docs-text' }))?.props.text as string | undefined
+
+  // The sections with pages, each page once, the groups over them.
+  await ui.press({ key: 'tab-tab10' })
+  expect(asked).toEqual(['https://code.claude.com/docs/_llms/ko.txt'])
+  expect(await texts()).toEqual(
+    expect.arrayContaining([
+      'Claude Code 문서',
+      '6개 · 19:20 읽음',
+      '시작하기',
+      '플랫폼 및 통합',
+      '플랫폼 및 통합 › 데스크톱용 Claude Code',
+      '위에서 문서를 고르세요.',
+    ]),
+  )
+  expect(await ui.find({ key: 'docs-section-1' })).toBeDefined()
+  expect(await ui.find({ key: 'docs-section-2' })).toBeDefined()
+  expect(await ui.find({ key: 'docs-section-3' })).toBeUndefined()
+  expect(await ui.find({ key: 'doc-desktop-quickstart' })).toBeDefined()
+
+  // A page picked is read, its title and line shown, and its first part:
+  // what comes before the first heading, the site's links made whole.
+  await ui.press({ key: 'doc-overview' })
+  expect(asked).toContain('https://code.claude.com/docs/ko/overview.md')
+  expect(await texts()).toEqual(expect.arrayContaining(['문서 내용', '머리말', '개요', 'Claude Code는 에이전트 코딩 도구입니다.']))
+  expect(await body()).toBe(
+    'Claude Code는 [VS Code](https://code.claude.com/docs/ko/vs-code)와 [터미널](https://example.com/terminal)에서 씁니다.',
+  )
+  expect((await ui.find({ key: 'docs-text' }))?.props.pressableLinks).toEqual(['https://code.claude.com/docs/ko/vs-code'])
+
+  // The next part is under its heading, a fence's attributes and an alert's
+  // mark dropped.
+  await ui.press({ key: 'docs-part-next' })
+  expect(await body()).toBe(
+    '## 시작하기\n\n```bash\ncurl -fsSL https://claude.ai/install.sh | bash\n```\n\n> **참고**\n>\n> 기본 설치는 자동으로 업데이트됩니다.',
+  )
+
+  // A long stretch is cut at a paragraph, the rest said to go on.
+  await ui.press({ key: 'docs-part-next' })
+  expect((await body())?.startsWith('## 다음 단계')).toBe(true)
+  await ui.press({ key: 'docs-part-end-next' })
+  expect(await texts()).toContain('다음 단계 (이어서)')
+  expect((await body())?.startsWith('다음 단계의 문단')).toBe(true)
+
+  // The headings list each heading once, and one pressed is turned to.
+  await ui.press({ key: 'docs-toc' })
+  expect(await ui.find({ key: 'docs-text' })).toBeUndefined()
+  expect(await ui.find({ key: 'docs-toc-0' })).toBeDefined()
+  expect(await ui.find({ key: 'docs-toc-1' })).toBeDefined()
+  expect(await ui.find({ key: 'docs-toc-3' })).toBeUndefined()
+  await ui.press({ key: 'docs-toc-1' })
+  expect((await body())?.startsWith('## 시작하기')).toBe(true)
+
+  await ui.press({ key: 'docs-open' })
+  expect(opened).toEqual([['open', 'https://code.claude.com/docs/ko/overview']])
+  await ui.press({ key: 'docs-send' })
+  expect(filled).toEqual(['https://code.claude.com/docs/ko/overview '])
+
+  // A link to another page turns the pane to it.
+  await ui.press({ key: 'docs-part-prev' })
+  await ui.press({ key: 'docs-text', link: { href: 'https://code.claude.com/docs/ko/vs-code' } })
+  expect(asked).toContain('https://code.claude.com/docs/ko/vs-code.md')
+  expect(await body()).toBe('확장을 설치합니다.')
+  expect(await ui.find({ key: 'docs-part-next' })).toBeUndefined()
+
+  // Another section lists its own pages; read again within minutes, nothing
+  // is fetched, and 새로고침 reads the index and the page.
+  await ui.press({ key: 'docs-section-1' })
+  expect(await ui.find({ key: 'doc-plugins/overview' })).toBeDefined()
+  expect(await ui.find({ key: 'doc-vs-code' })).toBeUndefined()
+  const before = asked.length
+  await ui.press({ key: 'tab-tab1' })
+  await ui.press({ key: 'tab-tab10' })
+  expect(asked).toHaveLength(before)
+  await ui.press({ key: 'docs-refresh' })
+  expect(asked.slice(before)).toEqual(['https://code.claude.com/docs/_llms/ko.txt', 'https://code.claude.com/docs/ko/vs-code.md'])
+
+  // A page the site keeps elsewhere is one to open in the browser.
+  await ui.press({ key: 'docs-section-0' })
+  await ui.press({ key: 'doc-changelog' })
+  expect(await texts()).toEqual(expect.arrayContaining(['이 문서는 사이트 밖에 있습니다. [열기]로', '브라우저에서 보세요.']))
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+test('a docs index that fails says so and keeps the sections it had', async ($, on) => {
+  world(on, 38, LIMITS, Date.parse('2026-10-22T19:20:00+09:00'))
+  let isUp = true
+  on('http.fetch', () => ({
+    value: isUp ? { status: 200, ok: true, headers: {}, text: DOCS_INDEX } : { status: 503, ok: false, headers: {}, text: '' },
+  }))
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+
+  await ui.press({ key: 'tab-tab10' })
+  isUp = false
+  await ui.press({ key: 'docs-refresh' })
+  expect(await texts()).toContain('문서 목록을 읽지 못했습니다(HTTP 503).')
+  expect(await ui.find({ key: 'doc-overview' })).toBeDefined()
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})

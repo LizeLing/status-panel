@@ -4,9 +4,16 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 import type {
   Account,
   Activity,
+  Article,
   Breakdown,
   Call,
   Detail,
+  DocIndex,
+  DocPart,
+  DocSection,
+  DocText,
+  DocView,
+  Feed,
   FileOp,
   Files,
   FileView,
@@ -17,6 +24,7 @@ import type {
   Hook,
   Info,
   Limit,
+  NewsView,
   Used,
 } from '../types'
 
@@ -50,16 +58,21 @@ type Tab = { id: string; label: string }
 
 const HARNESS_TAB = 'tab6'
 const FILES_TAB = 'tab7'
+const NEWS_TAB = 'tab8'
+const DOCS_TAB = 'tab10'
 
 // Status, git, the calendar, the harness (what the user's `~/.claude` and the
-// project set up, and what the session did with it), and the project's files
-// with what the agent did to each.
+// project set up, and what the session did with it), news from a few feeds,
+// the project's files with what the agent did to each, and Claude Code's
+// documentation in Korean.
 const TABS: readonly Tab[] = [
   { id: 'tab1', label: '상태' },
   { id: 'tab2', label: 'Git' },
   { id: 'tab5', label: '달력' },
   { id: HARNESS_TAB, label: '하네스' },
+  { id: NEWS_TAB, label: '뉴스' },
   { id: FILES_TAB, label: '파일' },
+  { id: DOCS_TAB, label: '문서' },
 ]
 
 // Inside the harness tab: a row of scopes, then a row of kinds. After the two
@@ -1407,7 +1420,464 @@ const beat = async ($: EngineInterface, isOn?: boolean) => {
   }
 }
 
+// The news tab's feeds. GeekNews gives no feed of its newest page, but its
+// own feed is in the same order. GitHub's trending repositories have no feed
+// at all: they are read from the page, two rows each. claude.dev is
+// Anthropic's blog on building with Claude.
+const SOURCES: readonly (Tab & { url: string; heading?: string; isTrending?: boolean })[] = [
+  { id: 'geeknews', label: 'GeekNews', url: 'https://news.hada.io/rss/news' },
+  { id: 'inven', label: '인벤', url: 'https://webzine.inven.co.kr/news/rss.php' },
+  { id: 'aitimes', label: 'AI타임스', url: 'https://www.aitimes.com/rss/allArticle.xml' },
+  { id: 'github', label: 'GitHub', url: 'https://github.com/trending', heading: 'GitHub 트렌딩', isTrending: true },
+  { id: 'claudedev', label: 'claude.dev', url: 'https://claude.dev/rss.xml', heading: 'claude.dev 블로그' },
+]
+const NEWS_ROWS = 10
+const NEWS_FRESH_MS = 10 * 60 * 1000
+const ARTICLES_MAX = 50
+const SUMMARY_CHARS = 300
+const SUMMARY_ROWS = 4
+const AGE_CELLS = 6
+const NO_NEWS_VIEW: NewsView = { source: 'geeknews', page: 0, picked: '' }
+
+const news = atom({ plugin: 'status-panel', key: 'news' } as const, {})
+const newsView = atom({ plugin: 'status-panel', key: 'newsView' } as const, NO_NEWS_VIEW)
+
+const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }
+
+const unescape = (text: string) =>
+  text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, name: string) => {
+    if (name[0] !== '#') {
+      return ENTITIES[name.toLowerCase()] ?? whole
+    }
+
+    const code = name[1] === 'x' || name[1] === 'X' ? parseInt(name.slice(2), 16) : Number(name.slice(1))
+
+    return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole
+  })
+
+// An element's text as plain words: a CDATA section is markup as it is, any
+// other text is escaped once more; a block's tags part words, others go.
+const textOf = (raw: string) => {
+  const html = raw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>|([^<]+)/g, (_, cdata?: string, text?: string) =>
+    cdata ?? unescape(text ?? ''),
+  )
+
+  return unescape(html.replace(/<\/?(?:p|br|div|li|ul|ol|h\d|tr|td|img|blockquote|figure)\b[^>]*>/gi, ' ').replace(/<[^>]*>/g, ''))
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// The first of some elements a block has, as it is written.
+const element = (block: string, names: readonly string[]) => {
+  for (const name of names) {
+    const found = new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`).exec(block)
+
+    if (found !== null) {
+      return found[1] ?? ''
+    }
+  }
+
+  return ''
+}
+
+// A feed's date: RFC 822 or ISO 8601; a bare `YYYY-MM-DD HH:MM:SS`, as
+// AI타임스 writes it, is Korean time.
+const dateOf = (text: string) => {
+  if (text === '') {
+    return NaN
+  }
+
+  const bare = /^(\d{4}-\d\d-\d\d) (\d\d:\d\d(?::\d\d)?)$/.exec(text)
+
+  return Date.parse(bare === null ? text : `${bare[1]}T${bare[2]}+09:00`)
+}
+
+// The articles of an RSS or Atom feed, in its order; an entry with no title
+// or link is left out.
+const parseFeed = (xml: string): Article[] =>
+  (xml.match(/<(item|entry)[\s>][\s\S]*?<\/\1>/g) ?? [])
+    .map(block => {
+      const link =
+        textOf(element(block, ['link'])) ||
+        (/<link\b[^>]*\bhref=["']([^"']+)["']/.exec(block)?.[1] ?? '')
+      const summary = textOf(element(block, ['description', 'summary', 'content']))
+
+      return {
+        title: textOf(element(block, ['title'])),
+        link: unescape(link.trim()),
+        summary: summary.length > SUMMARY_CHARS ? `${summary.slice(0, SUMMARY_CHARS)}…` : summary,
+        at: dateOf(textOf(element(block, ['pubDate', 'published', 'updated', 'dc:date']))),
+      }
+    })
+    .filter(one => one.title !== '' && one.link !== '')
+    .slice(0, ARTICLES_MAX)
+
+// How long ago an article came out: minutes, hours, then days.
+const ago = (at: number, now: number) => {
+  if (Number.isNaN(at)) {
+    return ''
+  }
+
+  const minutes = Math.max(0, Math.floor((now - at) / 60000))
+
+  return minutes < 60 ? `${minutes}분` : minutes < 1440 ? `${Math.floor(minutes / 60)}시간` : `${Math.floor(minutes / 1440)}일`
+}
+
+// A count as GitHub writes it (`1,397`), short: `+1.4k`.
+const gained = (written: string) => {
+  const count = Number(written.replace(/,/g, ''))
+
+  return written === '' || Number.isNaN(count) ? '' : count >= 1000 ? `+${(count / 1000).toFixed(1)}k` : `+${count}`
+}
+
+// The repositories of GitHub's trending page, in its order.
+const parseTrending = (page: string): Article[] =>
+  (page.match(/<article class="Box-row"[\s\S]*?<\/article>/g) ?? [])
+    .map(block => {
+      const repo = /<h2[\s\S]*?href="\/([^"]+)"/.exec(block)?.[1] ?? ''
+      const language = textOf(/itemprop="programmingLanguage">([^<]*)</.exec(block)?.[1] ?? '')
+      const stars = /href="\/[^"]+\/stargazers"[\s\S]*?<\/svg>\s*([\d,]+)/.exec(block)?.[1] ?? ''
+      const today = /([\d,]+) stars today/.exec(block)?.[1] ?? ''
+      const words = textOf(/<p class="[^"]*">([\s\S]*?)<\/p>/.exec(block)?.[1] ?? '')
+
+      return {
+        title: repo,
+        link: `https://github.com/${repo}`,
+        summary: words.length > SUMMARY_CHARS ? `${words.slice(0, SUMMARY_CHARS)}…` : words,
+        at: NaN,
+        aside: gained(today),
+        meta: [language, stars === '' ? '' : `★${stars}`, today === '' ? '' : `오늘 +${today}`].filter(one => one !== '').join(' · '),
+      }
+    })
+    .filter(one => one.title !== '')
+    .slice(0, ARTICLES_MAX)
+
+const hostOf = (link: string) => /^[a-z]+:\/\/(?:www\.)?([^/?#]+)/i.exec(link)?.[1] ?? link
+
+// The feeds being read, so a feed is asked for once at a time.
+const reading = new Set<string>()
+
+// Reads a source's feed, unless it was read well within the last minutes; a
+// feed that fails keeps the articles it had and says what went wrong.
+const readFeed = async ($: EngineInterface, id: string, isForced: boolean) => {
+  const source = SOURCES.find(one => one.id === id)
+
+  if (source === undefined || reading.has(id)) {
+    return
+  }
+
+  const held = (await read($, news))[id]
+  const now = await $.clock.now()
+
+  if (!isForced && held !== undefined && held.error === '' && now - held.readAt < NEWS_FRESH_MS) {
+    return
+  }
+
+  reading.add(id)
+
+  try {
+    const got = await $.http.fetch(source.url).catch(() => null)
+    const articles = got?.ok !== true ? [] : source.isTrending === true ? parseTrending(got.text) : parseFeed(got.text)
+    const error =
+      got === null
+        ? '피드를 읽지 못했습니다.'
+        : !got.ok
+          ? `피드를 읽지 못했습니다(HTTP ${got.status}).`
+          : articles.length === 0
+            ? '피드에 기사가 없습니다.'
+            : ''
+    const next: Feed =
+      error === '' ? { articles, readAt: now, error } : { articles: held?.articles ?? [], readAt: held?.readAt ?? 0, error }
+    await update($, news, feeds => ({ ...feeds, [id]: next }))
+  } finally {
+    reading.delete(id)
+  }
+}
+
+// A change as plain words with its code still in backticks: a mark escaped
+// outside code is the mark itself, and an escaped backtick a quote, so the
+// backticks left pair up.
+const unmark = (text: string) => {
+  let plain = ''
+  let isCode = false
+
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at] ?? ''
+    const after = text[at + 1] ?? ''
+
+    if (char === '`') {
+      isCode = !isCode
+      plain += char
+    } else if (!isCode && char === '\\' && /[!-/:-@[-`{-~]/.test(after)) {
+      plain += after === '`' ? "'" : after
+      at += 1
+    } else {
+      plain += char
+    }
+  }
+
+  return plain
+}
+
+// Claude Code's documentation in Korean: the index the site gives for it (a
+// section under each `###`, a group under each `####`, one under that under
+// each `#####`, then a page in each bullet), and each page in markdown.
+const DOCS_URL = 'https://code.claude.com/docs/ko'
+const DOCS_INDEX_URL = 'https://code.claude.com/docs/_llms/ko.txt'
+const DOC_ROWS = 12
+// A part of a page grows to about this many characters, then ends at a
+// paragraph; a heading always starts one.
+const PART_CHARS = 2400
+// The most of a part a drawing is given, well under what one may draw.
+const PART_MAX = 60000
+// The pages read are kept, the oldest let go past this many.
+const DOC_TEXTS_MAX = 12
+const DOC_PAGE = /^- \[(.*)\]\(https:\/\/code\.claude\.com\/docs\/ko\/([^)\s]+?)(?:\.md)?\)(?::\s*(.*))?$/
+const DOC_LINK = /^https:\/\/code\.claude\.com\/docs\/ko\/([^#?]+?)(?:\.md)?(?:[#?].*)?$/
+// GitHub's alerts, as the pages write their notes, by the words drawn instead.
+const ALERTS: Record<string, string> = { NOTE: '참고', TIP: '팁', IMPORTANT: '중요', WARNING: '경고', CAUTION: '주의' }
+const NO_DOC_VIEW: DocView = { section: 0, page: 0, picked: '', part: 0, isToc: false }
+const docIndex = atom({ plugin: 'status-panel', key: 'docIndex' } as const, null)
+const docTexts = atom({ plugin: 'status-panel', key: 'docTexts' } as const, {})
+const docView = atom({ plugin: 'status-panel', key: 'docView' } as const, NO_DOC_VIEW)
+
+// The sections of the index, each page once, none left empty.
+const parseDocIndex = (markdown: string) => {
+  const sections: DocSection[] = []
+  const seen = new Set<string>()
+  let outer = ''
+
+  for (const line of markdown.split('\n')) {
+    const heading = /^(#{3,5}) (.+?)\s*$/.exec(line)
+    const section = sections[sections.length - 1]
+
+    if (heading !== null) {
+      const depth = heading[1]?.length ?? 0
+      const name = unmark(heading[2] ?? '')
+
+      if (depth === 3) {
+        sections.push({ name, groups: [] })
+      } else if (section !== undefined) {
+        outer = depth === 4 ? name : outer
+        section.groups.push({ name: depth === 4 || outer === '' ? name : `${outer} › ${name}`, pages: [] })
+      }
+
+      continue
+    }
+
+    const listed = DOC_PAGE.exec(line)
+    const slug = listed?.[2] ?? ''
+
+    if (listed === null || section === undefined || seen.has(slug)) {
+      continue
+    }
+
+    if (section.groups.length === 0) {
+      section.groups.push({ name: '', pages: [] })
+    }
+
+    seen.add(slug)
+    section.groups[section.groups.length - 1]?.pages.push({
+      slug,
+      title: unmark(listed[1] ?? slug),
+      about: unmark(listed[3] ?? ''),
+    })
+  }
+
+  return sections
+    .map(one => ({ ...one, groups: one.groups.filter(group => group.pages.length > 0) }))
+    .filter(one => one.groups.length > 0)
+}
+
+// A section's list in rows: each group's name over its pages.
+const docRows = (section: DocSection) =>
+  section.groups.flatMap(group => [
+    ...(group.name === '' ? [] : [{ kind: 'group' as const, name: group.name }]),
+    ...group.pages.map(page => ({ kind: 'page' as const, page })),
+  ])
+
+// Where a page is listed: its section, and the page of that section's list.
+const placeOfDoc = (sections: DocSection[], slug: string) => {
+  for (const [section, one] of sections.entries()) {
+    const at = docRows(one).findIndex(each => each.kind === 'page' && each.page.slug === slug)
+
+    if (at >= 0) {
+      return { section, page: Math.floor(at / DOC_ROWS) }
+    }
+  }
+
+  return undefined
+}
+
+const findDoc = (sections: DocSection[], slug: string) =>
+  sections.flatMap(one => one.groups.flatMap(group => group.pages)).find(one => one.slug === slug)
+
+// A page's markdown as a drawing takes it, in parts: the note on the index
+// above its title, the title and the line under it (the index has them) left
+// out; links to the site made whole, a fence's attributes and the alerts'
+// marks dropped. A part never ends inside a fence.
+const parseDoc = (markdown: string) => {
+  const lines = markdown
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+    .split('\n')
+  const titleAt = lines.findIndex(line => line.startsWith('# '))
+  const title = titleAt < 0 ? '' : unmark(lines[titleAt]?.slice(2).trim() ?? '')
+  let at = titleAt + 1
+
+  // The line under the title, a quote.
+  while (lines[at]?.trim() === '') {
+    at += 1
+  }
+
+  while ((lines[at] ?? '').startsWith('>')) {
+    at += 1
+  }
+
+  const parts: DocPart[] = []
+  let heading = ''
+  let held: string[] = []
+  let fence = ''
+  const close = () => {
+    const text = held.join('\n').trim()
+
+    if (text !== '') {
+      parts.push({ heading, text: text.length > PART_MAX ? `${text.slice(0, PART_MAX)}\n\n…` : text })
+    }
+
+    held = []
+  }
+
+  for (const raw of lines.slice(at)) {
+    const fenced = /^(\s*)(`{3,}|~{3,})(\S*)/.exec(raw)
+    let line = raw
+
+    if (fenced !== null) {
+      const mark = fenced[2] ?? ''
+
+      if (fence === '') {
+        fence = mark
+        line = `${fenced[1] ?? ''}${mark}${fenced[3] ?? ''}`
+      } else if (mark.startsWith(fence) && raw.trim() === mark) {
+        fence = ''
+      }
+    } else if (fence === '') {
+      line = raw
+        .replace(/\]\(\//g, '](https://code.claude.com/')
+        .replace(/^(\s*>+\s*)\[!(\w+)\]\s*$/, (whole, quote: string, kind: string) =>
+          ALERTS[kind.toUpperCase()] === undefined ? whole : `${quote}**${ALERTS[kind.toUpperCase()]}**`,
+        )
+    }
+
+    if (fence === '' && fenced === null && line.startsWith('## ')) {
+      close()
+      heading = unmark(line.slice(3).trim())
+    } else if (fence === '' && fenced === null && line.trim() === '' && held.join('\n').length >= PART_CHARS) {
+      close()
+      continue
+    }
+
+    held.push(line)
+  }
+
+  close()
+
+  return { title, parts }
+}
+
+// Reads the index, unless it was read well within the last minutes; one that
+// fails keeps the sections it had and says what went wrong.
+const readDocIndex = async ($: EngineInterface, isForced: boolean) => {
+  const held = await read($, docIndex)
+  const now = await $.clock.now()
+
+  if (reading.has(DOCS_TAB) || (!isForced && held !== null && held.error === '' && now - held.readAt < NEWS_FRESH_MS)) {
+    return
+  }
+
+  reading.add(DOCS_TAB)
+
+  try {
+    const got = await $.http.fetch(DOCS_INDEX_URL).catch(() => null)
+    const sections = got?.ok === true ? parseDocIndex(got.text) : []
+    const error =
+      got === null
+        ? '문서 목록을 읽지 못했습니다.'
+        : !got.ok
+          ? `문서 목록을 읽지 못했습니다(HTTP ${got.status}).`
+          : sections.length === 0
+            ? '문서 목록에 페이지가 없습니다.'
+            : ''
+
+    await update($, docIndex, standing =>
+      error === '' ? { sections, readAt: now, error } : { sections: standing?.sections ?? [], readAt: standing?.readAt ?? 0, error },
+    )
+  } finally {
+    reading.delete(DOCS_TAB)
+  }
+}
+
+// Reads a page, as the index is; a page the site keeps elsewhere (it answers
+// with a web page, not markdown) is one to open in the browser.
+const readDocPage = async ($: EngineInterface, slug: string, isForced: boolean) => {
+  const held = (await read($, docTexts))[slug]
+  const now = await $.clock.now()
+  const key = `doc:${slug}`
+
+  if (reading.has(key) || (!isForced && held !== undefined && held.error === '' && now - held.readAt < NEWS_FRESH_MS)) {
+    return
+  }
+
+  reading.add(key)
+
+  try {
+    const got = await $.http.fetch(`${DOCS_URL}/${slug}.md`).catch(() => null)
+    const isPage = got?.ok === true && !/text\/html/i.test(got.headers['content-type'] ?? '') && !/^\s*<(!doctype|html)/i.test(got.text)
+    const made = isPage && got !== null ? parseDoc(got.text) : { title: '', parts: [] }
+    const error =
+      got === null
+        ? '문서를 읽지 못했습니다.'
+        : !got.ok
+          ? `문서를 읽지 못했습니다(HTTP ${got.status}).`
+          : !isPage
+            ? '이 문서는 사이트 밖에 있습니다. [열기]로 브라우저에서 보세요.'
+            : made.parts.length === 0
+              ? '문서에 내용이 없습니다.'
+              : ''
+
+    await update($, docTexts, standing => {
+      const kept = error === '' ? { ...made, readAt: now, error } : { title: '', parts: [], readAt: 0, ...standing[slug], error }
+      const all = { ...standing, [slug]: kept }
+      const oldest = Object.entries(all)
+        .sort(([, a], [, b]) => b.readAt - a.readAt)
+        .slice(DOC_TEXTS_MAX)
+        .map(([one]) => one)
+
+      return Object.fromEntries(Object.entries(all).filter(([one]) => one === slug || !oldest.includes(one)))
+    })
+  } finally {
+    reading.delete(key)
+  }
+}
+
+// Shows a page: its section's list turned to it, and its first part.
+const pickDoc = async ($: EngineInterface, slug: string) => {
+  const sections = (await read($, docIndex))?.sections ?? []
+  const place = placeOfDoc(sections, slug)
+
+  await update($, docView, held => ({
+    ...NO_DOC_VIEW,
+    ...held,
+    ...(place ?? {}),
+    picked: slug,
+    part: 0,
+    isToc: false,
+  }))
+  void readDocPage($, slug, false).catch(() => undefined)
+}
+
 const OPEN = '[열기]'
+const SEND = '[세션에 넣기]'
 
 // Hands an item's file to an app by name, or with none to the system's own.
 const openFile = async ($: EngineInterface, one: HarnessItem, app: string) => {
@@ -1612,6 +2082,11 @@ export const register: Register = (on, options) => {
     const project = await read($, files)
     const marks = (await read($, touched)) ?? {}
     const view: FileView = { ...NO_VIEW, ...(await read($, fileView)) }
+    const feeds = (await read($, news)) ?? {}
+    const newsAt: NewsView = { ...NO_NEWS_VIEW, ...(await read($, newsView)) }
+    const docList = await read($, docIndex)
+    const texts = await read($, docTexts)
+    const docAt: DocView = { ...NO_DOC_VIEW, ...(await read($, docView)) }
     const isFirst = shown === 'tab1'
     const acts = await read($, activity)
     const AGENT_COLORS: Record<string, string> = {
@@ -1923,6 +2398,20 @@ export const register: Register = (on, options) => {
           if (id === FILES_TAB) {
             await readProject($).catch(() => undefined)
           }
+
+          // The news shown is read when its tab is opened, unless it is fresh.
+          if (id === NEWS_TAB) {
+            void readFeed($, newsAt.source, false).catch(() => undefined)
+          }
+
+          // And the documentation's index, and the page that was open, when theirs is.
+          if (id === DOCS_TAB) {
+            void readDocIndex($, false).catch(() => undefined)
+
+            if (docAt.picked !== '') {
+              void readDocPage($, docAt.picked, false).catch(() => undefined)
+            }
+          }
         })}
         {isFirst && (
           <Box flexDirection="column">
@@ -2127,6 +2616,374 @@ export const register: Register = (on, options) => {
               )}
           </Box>
         )}
+        {shown === NEWS_TAB &&
+          (() => {
+            const source = SOURCES.find(one => one.id === newsAt.source) ?? SOURCES[0]
+            const feed = source === undefined ? undefined : feeds[source.id]
+            const articles = feed?.articles ?? []
+            const pages = Math.max(1, Math.ceil(articles.length / NEWS_ROWS))
+            const at = Math.min(newsAt.page, pages - 1)
+            const picked = articles.find(one => one.link === newsAt.picked)
+            const space = room - 2 - 1 - AGE_CELLS
+            const readAt = feed === undefined || feed.readAt === 0 ? null : new Date(feed.readAt)
+            const pager = `◂ 이전  ${at + 1}/${pages}  다음 ▸`
+            const when = picked === undefined || Number.isNaN(picked.at) ? null : new Date(picked.at)
+
+            if (source === undefined) {
+              return null
+            }
+
+            // A feed not yet read, as when the pane opens on this tab.
+            if (feed === undefined) {
+              void readFeed($, source.id, false).catch(() => undefined)
+            }
+
+            return (
+              <Box flexDirection="column">
+                {bar('news', SOURCES, source.id, async id => {
+                  await update($, newsView, now => ({ ...NO_NEWS_VIEW, ...now, source: id, page: 0, picked: '' }))
+                  void readFeed($, id, false).catch(() => undefined)
+                })}
+                {top(
+                  readAt === null
+                    ? (source.heading ?? source.label)
+                    : `${source.heading ?? source.label} · ${articles.length}개 · ${two(readAt.getHours())}:${two(readAt.getMinutes())} 읽음`,
+                )}
+                {feed === undefined && row(<Text dimColor>피드를 읽는 중입니다.</Text>)}
+                {feed !== undefined && feed.error !== '' && row(<Text color="red">{fit(feed.error, room, 'start')}</Text>)}
+                {articles.slice(at * NEWS_ROWS, (at + 1) * NEWS_ROWS).map((one, index) => {
+                  const age = one.aside ?? ago(one.at, now.now)
+                  // A repository's words go in a second row, dim.
+                  const words = source.isTrending === true ? one.summary || '(설명 없음)' : null
+
+                  return (
+                    <Box flexDirection="column">
+                      {row(
+                        <Box>
+                          <Text color="cyan">{one.link === newsAt.picked ? '› ' : '  '}</Text>
+                          <Button
+                            key={`news-${source.id}-${at * NEWS_ROWS + index}`}
+                            plain
+                            label={pad(fit(one.title, space, 'start'), space)}
+                            onPress={() =>
+                              update($, newsView, now => {
+                                const held = { ...NO_NEWS_VIEW, ...now }
+
+                                return { ...held, picked: held.picked === one.link ? '' : one.link }
+                              })
+                            }
+                          />
+                          <Text dimColor={one.aside === undefined} color={one.aside === undefined ? undefined : 'yellow'}>
+                            {' '.repeat(1 + Math.max(0, AGE_CELLS - cells(age)))}
+                            {age}
+                          </Text>
+                        </Box>,
+                      )}
+                      {words !== null && row(<Text dimColor>{`  ${fit(words, room - 2, 'start')}`}</Text>)}
+                    </Box>
+                  )
+                })}
+                {row(
+                  <Box>
+                    {at === 0 ? (
+                      <Text dimColor>◂ 이전</Text>
+                    ) : (
+                      <Button
+                        key="news-prev"
+                        plain
+                        label="◂ 이전"
+                        onPress={() => update($, newsView, now => ({ ...NO_NEWS_VIEW, ...now, page: at - 1 }))}
+                      />
+                    )}
+                    <Text dimColor>{`  ${at + 1}/${pages}  `}</Text>
+                    {at === pages - 1 ? (
+                      <Text dimColor>다음 ▸</Text>
+                    ) : (
+                      <Button
+                        key="news-next"
+                        plain
+                        label="다음 ▸"
+                        onPress={() => update($, newsView, now => ({ ...NO_NEWS_VIEW, ...now, page: at + 1 }))}
+                      />
+                    )}
+                    <Text>{' '.repeat(Math.max(1, room - cells(pager) - cells('새로고침')))}</Text>
+                    <Button
+                      key="news-refresh"
+                      plain
+                      label="새로고침"
+                      onPress={() => void readFeed($, source.id, true).catch(() => undefined)}
+                    />
+                  </Box>,
+                )}
+                {top(
+                  picked === undefined
+                    ? '세부 내용'
+                    : picked.meta !== undefined
+                      ? `세부 내용 · ${picked.meta}`
+                      : when === null
+                        ? `세부 내용 · ${source.label}`
+                        : `세부 내용 · ${source.label} · ${two(when.getMonth() + 1)}/${two(when.getDate())} ${two(when.getHours())}:${two(when.getMinutes())}`,
+                )}
+                {picked === undefined && row(<Text dimColor>위에서 기사를 고르세요.</Text>)}
+                {picked !== undefined &&
+                  (() => {
+                    const summary = wrapWords(picked.summary, room)
+
+                    return (
+                      <Box flexDirection="column">
+                        {wrapWords(picked.title, room).map(line => row(<Text bold>{line}</Text>))}
+                        {picked.summary !== '' &&
+                          summary
+                            .slice(0, SUMMARY_ROWS)
+                            .map((line, index) =>
+                              row(
+                                <Text dimColor>
+                                  {index === SUMMARY_ROWS - 1 && summary.length > SUMMARY_ROWS ? fit(`${line}…`, room, 'start') : line}
+                                </Text>,
+                              ),
+                            )}
+                        {row(
+                          <Box>
+                            <Button
+                              key="news-open"
+                              plain
+                              label={OPEN}
+                              onPress={async () => {
+                                const opened = await $.process.run(['open', picked.link], { timeoutMs: 5000 }).catch(() => null)
+
+                                if (opened === null || opened.exitCode !== 0) {
+                                  $.ui.toast(`기사를 열지 못했습니다: ${hostOf(picked.link)}`)
+                                }
+                              }}
+                            />
+                            <Text> </Text>
+                            <Button
+                              key="news-send"
+                              plain
+                              label={SEND}
+                              onPress={async () => {
+                                const filled = await $.prompt.fill({ text: `${picked.link} `, mode: 'insert' }).catch(() => null)
+
+                                $.ui.toast(filled?.isFilled === true ? '프롬프트에 주소를 넣었습니다.' : '프롬프트에 넣지 못했습니다.')
+                              }}
+                            />
+                            <Text dimColor> {fit(hostOf(picked.link), room - cells(OPEN) - cells(SEND) - 2, 'start')}</Text>
+                          </Box>,
+                        )}
+                      </Box>
+                    )
+                  })()}
+              </Box>
+            )
+          })()}
+        {shown === DOCS_TAB &&
+          (() => {
+            const sections = docList?.sections ?? []
+            const sectionAt = Math.min(docAt.section, Math.max(0, sections.length - 1))
+            const section = sections[sectionAt]
+            const rows = section === undefined ? [] : docRows(section)
+            const pages = Math.max(1, Math.ceil(rows.length / DOC_ROWS))
+            const at = Math.min(docAt.page, pages - 1)
+            const count = sections.reduce((sum, one) => sum + one.groups.reduce((all, group) => all + group.pages.length, 0), 0)
+            const readAt = docList === null || docList.readAt === 0 ? null : new Date(docList.readAt)
+            const picked = docAt.picked === '' ? undefined : findDoc(sections, docAt.picked)
+            const text: DocText | undefined = picked === undefined ? undefined : texts[picked.slug]
+            const parts = text?.parts ?? []
+            const partAt = Math.min(docAt.part, Math.max(0, parts.length - 1))
+            const part: DocPart | undefined = parts[partAt]
+            const link = picked === undefined ? DOCS_URL : `${DOCS_URL}/${picked.slug}`
+            // The parts that start a heading, each a line of the headings' list.
+            const heads = parts.flatMap((one, index) => (index === 0 || parts[index - 1]?.heading !== one.heading ? [{ index, heading: one.heading }] : []))
+            // The links in the part shown to pages of the index, which the pane
+            // turns to rather than the browser.
+            const inner = [...(part?.text ?? '').matchAll(/\]\((https:\/\/code\.claude\.com\/docs\/ko\/[^)\s]+)\)/g)]
+              .map(one => one[1] ?? '')
+              .filter((one, index, all) => all.indexOf(one) === index && findDoc(sections, DOC_LINK.exec(one)?.[1] ?? '') !== undefined)
+              .slice(0, 256)
+            const toPart = async (place: number, isToc = false) => {
+              await update($, docView, held => ({ ...NO_DOC_VIEW, ...held, part: place, isToc }))
+              await $.ui.scroll({ in: PANE, to: { key: 'docs-open' }, block: 'start' }).catch(() => undefined)
+            }
+            const pager = (prefix: string, place: number, all: number, go: (page: number) => Promise<unknown>, end?: RenderChildren) => (
+              <Box>
+                {place === 0 ? (
+                  <Text dimColor>◂ 이전</Text>
+                ) : (
+                  <Button key={`${prefix}-prev`} plain label="◂ 이전" onPress={() => go(place - 1)} />
+                )}
+                <Text dimColor>{`  ${place + 1}/${all}  `}</Text>
+                {place === all - 1 ? (
+                  <Text dimColor>다음 ▸</Text>
+                ) : (
+                  <Button key={`${prefix}-next`} plain label="다음 ▸" onPress={() => go(place + 1)} />
+                )}
+                {end}
+              </Box>
+            )
+            const pagerCells = (place: number, all: number) => cells(`◂ 이전  ${place + 1}/${all}  다음 ▸`)
+
+            // An index not yet read, as when the pane opens on this tab; and
+            // the page it was on.
+            if (docList === null) {
+              void readDocIndex($, false).catch(() => undefined)
+            }
+
+            if (picked !== undefined && text === undefined) {
+              void readDocPage($, picked.slug, false).catch(() => undefined)
+            }
+
+            return (
+              <Box flexDirection="column">
+                {top(
+                  readAt === null
+                    ? 'Claude Code 문서'
+                    : `Claude Code 문서 · ${count}개 · ${two(readAt.getHours())}:${two(readAt.getMinutes())} 읽음`,
+                )}
+                {docList === null && row(<Text dimColor>문서 목록을 읽는 중입니다.</Text>)}
+                {docList !== null && docList.error !== '' && row(<Text color="red">{fit(docList.error, room, 'start')}</Text>)}
+                {sections.length > 0 &&
+                  bar(
+                    'docs-section',
+                    sections.map((one, index) => ({ id: String(index), label: one.name })),
+                    String(sectionAt),
+                    id => update($, docView, held => ({ ...NO_DOC_VIEW, ...held, section: Number(id), page: 0 })),
+                  )}
+                {rows.slice(at * DOC_ROWS, (at + 1) * DOC_ROWS).map(one =>
+                  one.kind === 'group'
+                    ? row(<Text bold color="cyan">{fit(one.name, room, 'start')}</Text>)
+                    : row(
+                        <Box>
+                          <Text color="cyan">{one.page.slug === picked?.slug ? '› ' : '  '}</Text>
+                          <Button
+                            key={`doc-${one.page.slug}`}
+                            plain
+                            label={fit(one.page.title, room - 2, 'start')}
+                            onPress={() => pickDoc($, one.page.slug)}
+                          />
+                        </Box>,
+                      ),
+                )}
+                {sections.length > 0 &&
+                  row(
+                    pager(
+                      'docs',
+                      at,
+                      pages,
+                      place => update($, docView, held => ({ ...NO_DOC_VIEW, ...held, page: place })),
+                      <Box>
+                        <Text>{' '.repeat(Math.max(1, room - pagerCells(at, pages) - cells('새로고침')))}</Text>
+                        <Button
+                          key="docs-refresh"
+                          plain
+                          label="새로고침"
+                          onPress={async () => {
+                            await readDocIndex($, true).catch(() => undefined)
+
+                            if (picked !== undefined) {
+                              await readDocPage($, picked.slug, true).catch(() => undefined)
+                            }
+                          }}
+                        />
+                      </Box>,
+                    ),
+                  )}
+                {top(
+                  picked === undefined || parts.length === 0
+                    ? '문서 내용'
+                    : `문서 내용 · ${part?.heading === '' ? '머리말' : fit(part?.heading ?? '', room - 12, 'start')}`,
+                )}
+                {picked === undefined && row(<Text dimColor>위에서 문서를 고르세요.</Text>)}
+                {picked !== undefined && (
+                  <Box flexDirection="column">
+                    {wrapWords(text?.title || picked.title, room).map(line => row(<Text bold>{line}</Text>))}
+                    {row(
+                      <Box>
+                        <Button
+                          key="docs-open"
+                          plain
+                          label={OPEN}
+                          onPress={async () => {
+                            const opened = await $.process.run(['open', link], { timeoutMs: 5000 }).catch(() => null)
+
+                            if (opened === null || opened.exitCode !== 0) {
+                              $.ui.toast(`문서를 열지 못했습니다: ${hostOf(link)}`)
+                            }
+                          }}
+                        />
+                        <Text> </Text>
+                        <Button
+                          key="docs-send"
+                          plain
+                          label={SEND}
+                          onPress={async () => {
+                            const filled = await $.prompt.fill({ text: `${link} `, mode: 'insert' }).catch(() => null)
+
+                            $.ui.toast(filled?.isFilled === true ? '프롬프트에 주소를 넣었습니다.' : '프롬프트에 넣지 못했습니다.')
+                          }}
+                        />
+                      </Box>,
+                    )}
+                    {picked.about !== '' && wrapWords(picked.about, room).map(line => row(<Text dimColor>{line}</Text>))}
+                    {text === undefined && row(<Text dimColor>문서를 읽는 중입니다.</Text>)}
+                    {text !== undefined && text.error !== '' && wrapWords(text.error, room).map(line => row(<Text color="red">{line}</Text>))}
+                    {parts.length > 1 &&
+                      row(
+                        pager(
+                          'docs-part',
+                          partAt,
+                          parts.length,
+                          place => toPart(place),
+                          <Box>
+                            <Text>{' '.repeat(Math.max(1, room - pagerCells(partAt, parts.length) - cells('목차')))}</Text>
+                            <Button key="docs-toc" plain label="목차" onPress={() => toPart(partAt, !docAt.isToc)} />
+                          </Box>,
+                        ),
+                      )}
+                    {docAt.isToc &&
+                      heads.map(one =>
+                        row(
+                          <Box>
+                            <Text color="cyan">{one.index <= partAt && (heads.find(each => each.index > one.index)?.index ?? parts.length) > partAt ? '› ' : '  '}</Text>
+                            <Button
+                              key={`docs-toc-${one.index}`}
+                              plain
+                              label={fit(one.heading === '' ? '머리말' : one.heading, room - 2, 'start')}
+                              onPress={() => toPart(one.index)}
+                            />
+                          </Box>,
+                        ),
+                      )}
+                    {!docAt.isToc && part !== undefined && (
+                      <Box flexDirection="column">
+                        <Text> </Text>
+                        {partAt > 0 && parts[partAt - 1]?.heading === part.heading && part.heading !== '' &&
+                          row(<Text dimColor>{fit(`${part.heading} (이어서)`, room, 'start')}</Text>)}
+                        <Box paddingLeft={2} width={width}>
+                          <Markdown
+                            key="docs-text"
+                            text={part.text}
+                            pressableLinks={inner}
+                            onLinkPress={pressed => {
+                              const slug = DOC_LINK.exec(pressed.href)?.[1]
+
+                              if (slug !== undefined && findDoc(sections, slug) !== undefined) {
+                                void pickDoc($, slug)
+                                  .then(() => $.ui.scroll({ in: PANE, to: { key: 'docs-open' }, block: 'start' }))
+                                  .catch(() => undefined)
+                              }
+                            }}
+                          />
+                        </Box>
+                      </Box>
+                    )}
+                    {!docAt.isToc &&
+                      parts.length > 1 &&
+                      row(pager('docs-part-end', partAt, parts.length, place => toPart(place)))}
+                  </Box>
+                )}
+              </Box>
+            )
+          })()}
         {shown === FILES_TAB &&
           (() => {
             const rows = fileRows(project?.paths ?? [], marks, view)
