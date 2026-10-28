@@ -230,6 +230,35 @@ test('each rate-limit window is drawn as /usage draws it: name, meter, reset', a
   await ui.unmount()
 })
 
+const UNTIL = [
+  { kind: 'five_hour', percentUsed: 38, resetsAt: new Date(2026, 9, 22, 16, 50).toISOString() },
+  { kind: 'seven_day', percentUsed: 71, resetsAt: new Date(2026, 9, 25, 19, 0).toISOString() },
+] satisfies SessionRateLimit[]
+
+test('the clock shows the time left in the session and the week on either side', async ($, on) => {
+  world(on, 38, UNTIL, new Date(2026, 9, 22, 14, 37).getTime())
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
+
+  expect((await ui.find({ type: 'Text', text: '세션  ' }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ type: 'Text', text: '02:13  ' }))?.props.color).toBe('green')
+  expect((await ui.find({ type: 'Text', text: '  주간' }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ type: 'Text', text: '  3일 04:23' }))?.props.color).toBe('yellow')
+  await ui.unmount()
+})
+
+test('a narrow pane puts the time left in one row beneath the clock', async ($, on) => {
+  world(on, 38, UNTIL, new Date(2026, 9, 22, 16, 5).getTime())
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE })
+
+  expect(await ui.find({ type: 'Text', text: '세션 ' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '00:45' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '주간 ' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '3일 02:55' })).toBeDefined()
+  await ui.unmount()
+})
+
 test('the session row shows the time elapsed, the prompts sent and the cost', async ($, on) => {
   world(on, 38, LIMITS, (83 * 60 + 5) * 1000, { costUsd: 1.234 })
   await $.command.run(RUN)
@@ -994,6 +1023,200 @@ test('the files tab lists the project as a tree and marks what the agent made, r
   await ui.unmount()
 })
 
+test('under 바뀐 것 the files tab lists git\'s changes against HEAD and shows the hunks of the one picked', async ($, on) => {
+  world(on, 38, LIMITS, 0, { repo: { root: '/p', remote: null, internal: false, name: 'p' } })
+  const long = Array.from({ length: 80 }, (_, at) => `+line ${at}`)
+  let named = 'M\0src/b.ts\0A\0added.ts\0D\0old.md\0'
+  const ran: string[][] = []
+  on('session.root', () => ({ value: '/p' }))
+  on('process.run', (_, e) => {
+    const args = e.argv.slice(3).join(' ')
+    ran.push([...e.argv])
+    const answers: Record<string, [number, string]> = {
+      'ls-files -z --cached --others --exclude-standard': [0, 'a.md\0src/b.ts\0added.ts\0new.txt\0'],
+      'diff HEAD --no-renames --name-status -z': [0, named],
+      'diff HEAD --no-renames --numstat -z': [0, '2\t1\tsrc/b.ts\0' + `${long.length}\t0\tadded.ts\0` + '0\t4\told.md\0'],
+      'ls-files -z --others --exclude-standard': [0, 'new.txt\0'],
+      'diff HEAD --no-color --no-renames -- src/b.ts': [
+        0,
+        'diff --git a/src/b.ts b/src/b.ts\n--- a/src/b.ts\n+++ b/src/b.ts\n@@ -1,2 +1,3 @@\n a\n-b\n+c\n+d\n',
+      ],
+      'diff HEAD --no-color --no-renames -- added.ts': [0, `--- /dev/null\n+++ b/added.ts\n@@ -0,0 +1,80 @@\n${long.join('\n')}\n`],
+      'diff --no-color --no-index -- /dev/null new.txt': [1, '--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n'],
+    }
+    const [exitCode, stdout] = answers[args] ?? [0, '']
+
+    return { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+  const has = async (key: string) => (await ui.find({ key })) !== undefined
+  const source = async () => (await ui.find({ type: 'Code' }))?.props.source
+
+  await ui.press({ key: 'tab-tab7' })
+  await ui.press({ key: 'files-diff' })
+
+  // The changed files in order, the one git does not track yet among them,
+  // each with its counts and the letter the files tab marks it with.
+  expect((await ui.findAll({ type: 'Button' })).map(one => one.key).filter(key => key?.startsWith('change-'))).toEqual([
+    'change-added.ts',
+    'change-new.txt',
+    'change-old.md',
+    'change-src/b.ts',
+  ])
+  expect(await texts()).toEqual(expect.arrayContaining(['4개', '+82', '-5', '+2', '-1', 'C', 'D', 'U']))
+
+  // A picked file's hunks, drawn as a diff.
+  await ui.press({ key: 'change-src/b.ts' })
+  expect((await ui.find({ type: 'Code' }))?.props.format).toBe('diff')
+  expect(await source()).toBe('@@ -1,2 +1,3 @@\n a\n-b\n+c\n+d')
+  expect(await has('change-open')).toBe(true)
+
+  // A hunk longer than the room is cut, its header counting what is left.
+  await ui.press({ key: 'change-added.ts' })
+  expect(String(await source()).split('\n')[0]).toBe('@@ -0,0 +1,59 @@')
+  expect(await texts()).toContain('… 외 21줄')
+
+  // One git does not track yet is read against nothing; a removed one cannot be opened.
+  await ui.press({ key: 'change-new.txt' })
+  expect(await source()).toBe('@@ -0,0 +1 @@\n+hello')
+  await ui.press({ key: 'change-old.md' })
+  expect(await has('change-open')).toBe(false)
+
+  // Read again on request.
+  named = 'M\0src/b.ts\0'
+  await ui.press({ key: 'changes-reload' })
+  expect(await has('change-added.ts')).toBe(false)
+  expect(await has('change-new.txt')).toBe(true)
+
+  // The other views are as they were.
+  await ui.press({ key: 'files-all' })
+  expect(await has('change-new.txt')).toBe(false)
+  expect(await has('file-a.md')).toBe(true)
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+test('/diff opens the files tab under 바뀐 것 instead of the engine\'s diff panel', async ($, on) => {
+  world(on, 38, LIMITS, 0, { repo: { root: '/p', remote: null, internal: false, name: 'p' } })
+  let isEngine = false
+  on('session.root', () => ({ value: '/p' }))
+  on('command.run', { command: 'diff' }, () => {
+    isEngine = true
+
+    return { text: 'engine' }
+  })
+  on('process.run', (_, e) => {
+    const answers: Record<string, string> = {
+      'ls-files -z --cached --others --exclude-standard': 'a.md\0src/b.ts\0',
+      'diff HEAD --no-renames --name-status -z': 'M\0src/b.ts\0',
+      'diff HEAD --no-renames --numstat -z': '2\t1\tsrc/b.ts\0',
+    }
+    const stdout = answers[e.argv.slice(3).join(' ')] ?? ''
+
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.command.run(RUN)
+  const done = await $.command.run({ ...RUN, command: 'diff' })
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE })
+
+  expect(isEngine).toBe(false)
+  expect(done.text).toBe('Changes opened in the status pane.')
+  expect(await ui.find({ key: 'change-src/b.ts' })).toBeDefined()
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+test('under 사용됨 each piece notes the tokens it took, as its loop measured them', async ($, on) => {
+  world(on, 38, LIMITS)
+  harness(on)
+  // The requests, in order: the main loop's, then a subagent's, then the main
+  // loop's once more. Each reports what its prompt held and what it wrote.
+  const usages = [
+    { input_tokens: 100, cache_creation_input_tokens: 9900, cache_read_input_tokens: 0, output_tokens: 500 },
+    // Grown by 1,200 past the last prompt and output: the MCP call's result.
+    { input_tokens: 0, cache_creation_input_tokens: 1200, cache_read_input_tokens: 10500, output_tokens: 300 },
+    // Grown by 2,000: a skill and a shell command's output came in together.
+    { input_tokens: 0, cache_creation_input_tokens: 2000, cache_read_input_tokens: 12000, output_tokens: 200 },
+    { input_tokens: 10, cache_creation_input_tokens: 5000, cache_read_input_tokens: 20000, output_tokens: 1000, model: 'claude-sonnet-5-5' },
+    { input_tokens: 0, cache_creation_input_tokens: 400, cache_read_input_tokens: 14200, output_tokens: 100 },
+  ]
+  on('turn.step', async function* (_, e) {
+    const usage = { model: 'claude-opus-5-5', ...usages.shift() } as never
+
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use', usage }
+  })
+  on('tool.call', { tool: /^mcp__/ }, () => ({ result: {}, text: 'x'.repeat(3000) }) as never)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: {}, text: 'y'.repeat(1000) }) as never)
+  on('tool.call', { tool: 'Skill' }, async () => {
+    await $.skill.prompt({ skill: 'lastmile', text: 't'.repeat(4000) } as never)
+
+    return { result: {}, text: 'Launching skill: lastmile' } as never
+  })
+  on('skill.prompt', (_, e) => ({ text: e.text }))
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'a1' }) as never)
+  const step = async (index: number, agentId?: string) => {
+    const stream = $.turn.step({ turnId: agentId ?? 't1', index, model: 'm', messageCount: 1, agentId })
+
+    for await (const _ of stream) {
+      // The response's chunks; none here.
+    }
+  }
+
+  await $.command.run(RUN)
+  await step(0)
+  await $.tool.call({ tool: 'mcp__rea__open_binary' } as never)
+  await step(1)
+  await $.tool.call({ tool: 'Skill', skill: 'lastmile' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'make' })
+  await step(2)
+  await $.agent.spawn({ subagentType: 'lastmile-worker', prompt: 'p', description: 'd' } as never)
+  await step(0, 'a1')
+  await step(3)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+  // A name's value, the next text after it in the details.
+  const valueOf = async (name: string) => {
+    const all = await texts()
+
+    return all[all.indexOf(name) + 1]
+  }
+
+  await ui.press({ key: 'tab-tab6' })
+  await ui.press({ key: 'scope-used' })
+
+  // The MCP call's result was measured alone: exact, and read by the two
+  // main requests since.
+  await ui.press({ key: 'kind-mcp' })
+  expect(await texts()).toContain('1회 · 1.2k')
+  expect((await texts()).some(one => one.endsWith('사용됨 1 · 1.2k'))).toBe(true)
+  await ui.press({ key: 'item-used/mcp/rea' })
+  expect(await valueOf('새로 처리')).toBe('1.2k')
+  expect(await valueOf('토큰 합')).toBe('3.6k')
+  expect(await valueOf('다시 읽음')).toBe('2회')
+  expect(await texts()).toContain('open_binary · 1회 · 1.2k')
+
+  // The skill shared its growth with the shell's output, by their lengths.
+  await ui.press({ key: 'kind-skills' })
+  expect(await texts()).toContain('1회 · ≈1.6k')
+
+  // The subagent's own requests, all four counts, priced by its model.
+  await ui.press({ key: 'kind-agents' })
+  expect(await texts()).toContain('1회 · 6.0k')
+  await ui.press({ key: 'item-used/agents/lastmile-worker' })
+  expect(await valueOf('새로 처리')).toBe('6.0k')
+  expect(await valueOf('토큰 합')).toBe('26k')
+  expect(await valueOf('비용')).toBe('$0.03')
+  expect(await valueOf('캐시 읽기')).toBe('20k')
+  expect(await valueOf('모델')).toBe('sonnet-5-5')
+  await ui.press({ key: 'item-used/agents/lastmile-worker' })
+  await ui.press({ key: 'kind-memory' })
+  await ui.press({ key: 'scope-global' })
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
 test('the news tab reads each source as it is shown, lists its articles and opens the one picked', async ($, on) => {
   const now = Date.parse('2026-10-18T17:42:00+09:00')
   world(on, 38, LIMITS, now)
@@ -1012,7 +1235,7 @@ test('the news tab reads each source as it is shown, lists its articles and open
       status: 200,
       text: `<rss version="2.0"><channel><title>AI타임스</title>
 <item><title>리퀴드 AI, &apos;d1-울트라&apos; 공개</title><link>https://www.aitimes.com/news/articleView.html?idxno=216371&amp;x=1</link>
-<description>&lt;p&gt;리퀴드 AI가 모델을 공개했다.&lt;/p&gt;</description><pubDate>2026-10-18 17:13:21</pubDate></item>
+<description>&lt;p&gt;${'리퀴드 AI가 모델을 공개했다. '.repeat(20).trim()}&lt;/p&gt;</description><pubDate>2026-10-18 17:13:21</pubDate></item>
 <item><title>구글 양자컴퓨터</title><link>https://www.aitimes.com/news/articleView.html?idxno=2</link><pubDate>Sat, 17 Oct 2026 16:40:31 +0900</pubDate></item>
 </channel></rss>`,
     },
@@ -1032,16 +1255,18 @@ test('the news tab reads each source as it is shown, lists its articles and open
   })
   await $.command.run(RUN)
   // As wide as the pane opens.
-  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 41 } })
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
   const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
   const labels = async () => (await ui.findAll({ type: 'Button' })).map(one => String(one.props.label).trim())
 
-  // The tab sits left of the files, and reads GeekNews first.
+  // The tab sits left of the files, and reads GeekNews first; an article
+  // takes one row, its summary left for the details.
   expect(asked).toEqual([])
   await ui.press({ key: 'tab-tab8' })
   expect(await ui.find({ key: 'news-claudedev' })).toBeDefined()
   expect(asked).toEqual(['https://news.hada.io/rss/news'])
   expect(await texts()).toEqual(expect.arrayContaining(['GeekNews', '2개 · 17:42 읽음', '7분', '3시간', '1/1', '위에서 기사를 고르세요.']))
+  expect(await texts()).not.toContain('생수 12병과 24병 & 비교')
   expect(await labels()).toEqual(expect.arrayContaining(['Show GN: 개당 — 단위가격 비교', 'Second', '새로고침']))
 
   // 새로고침 asks again.
@@ -1060,7 +1285,11 @@ test('the news tab reads each source as it is shown, lists its articles and open
   await ui.press({ key: 'news-aitimes' })
   expect(await texts()).toEqual(expect.arrayContaining(['28분', '1일', '위에서 기사를 고르세요.']))
   await ui.press({ key: 'news-aitimes-0' })
-  expect(await texts()).toEqual(expect.arrayContaining(["리퀴드 AI, 'd1-울트라' 공개", '리퀴드 AI가 모델을 공개했다.', 'aitimes.com']))
+  // The buttons come under the title, and the summary is shown whole after them.
+  const picked = await texts()
+  expect(picked).toEqual(expect.arrayContaining(["리퀴드 AI, 'd1-울트라' 공개", 'aitimes.com']))
+  expect(picked.join(' ').split('공개했다.')).toHaveLength(21)
+  expect(picked.indexOf('aitimes.com')).toBeLessThan(picked.findIndex(one => one.startsWith('리퀴드 AI가 모델을')))
   await ui.press({ key: 'news-open' })
   expect(opened[1]).toEqual(['open', 'https://www.aitimes.com/news/articleView.html?idxno=216371&x=1'])
 
@@ -1072,7 +1301,7 @@ test('the news tab reads each source as it is shown, lists its articles and open
   await ui.unmount()
 })
 
-test('GitHub trending lists each repository in two rows with its own words, and puts its address in the prompt', async ($, on) => {
+test('GitHub trending lists each repository in two rows, apart from the one above, and puts its address in the prompt', async ($, on) => {
   world(on, 38, LIMITS, Date.parse('2026-10-18T17:42:00+09:00'))
   const asked: string[] = []
   const filled: string[] = []
@@ -1087,18 +1316,16 @@ test('GitHub trending lists each repository in two rows with its own words, and 
   on('http.fetch', (_, e) => {
     asked.push(e.url)
 
-    if (e.url === 'https://github.com/trending') {
-      return {
-        value: {
-          status: 200,
-          ok: true,
-          headers: {},
-          text: `<html>${repo('stablyai/orca', 'Orca is the place for working with a fleet of agents &amp; more.', '1,830')}${repo('android/skills', '', '355')}</html>`,
-        },
-      }
-    }
-
-    return { value: { status: 404, ok: false, headers: {}, text: '' } }
+    return e.url === 'https://github.com/trending'
+      ? {
+          value: {
+            status: 200,
+            ok: true,
+            headers: {},
+            text: `<html>${repo('stablyai/orca', 'Orca is the place for working with a fleet of agents &amp; more.', '1,830')}${repo('android/skills', '', '355')}</html>`,
+          },
+        }
+      : { value: { status: 404, ok: false, headers: {}, text: '' } }
   })
   on('prompt.fill', (_, e) => {
     filled.push(e.text)
@@ -1106,23 +1333,24 @@ test('GitHub trending lists each repository in two rows with its own words, and 
     return { isFilled: true, text: e.text, cursor: e.text.length }
   })
   await $.command.run(RUN)
-  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 41 } })
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
   const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
 
   await ui.press({ key: 'tab-tab8' })
   await ui.press({ key: 'news-github' })
   expect(asked).toEqual(['https://news.hada.io/rss/news', 'https://github.com/trending'])
-  expect(await texts()).toEqual(expect.arrayContaining(['GitHub 트렌딩', '2개 · 17:42 읽음', '+1.8k', '+355', '(설명 없음)']))
+  expect(await texts()).toEqual(
+    expect.arrayContaining(['GitHub 트렌딩', '2개 · 17:42 읽음', '+1.8k', '+355', '(설명 없음)']),
+  )
+  // A blank row between the two repositories.
+  const raw = (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+  const between = raw.slice(raw.findIndex(one => one.startsWith('Orca is the place')) + 1, raw.indexOf('+355'))
+  expect(between).toContain('')
 
-  // Its details: language and stars over its words.
+  // Its details: language and stars, and GitHub's own words.
   await ui.press({ key: 'news-github-0' })
   expect(await texts()).toEqual(
-    expect.arrayContaining([
-      'TypeScript · ★95,792 · 오늘 +1,830',
-      'stablyai/orca',
-      'Orca is the place for working with a',
-      'fleet of agents & more.',
-    ]),
+    expect.arrayContaining(['TypeScript · ★95,792 · 오늘 +1,830', 'stablyai/orca', 'Orca is the place for working with a fleet of', 'agents & more.']),
   )
   await ui.press({ key: 'news-send' })
   expect(filled).toEqual(['https://github.com/stablyai/orca '])
@@ -1131,6 +1359,160 @@ test('GitHub trending lists each repository in two rows with its own words, and 
   await ui.press({ key: 'news-geeknews' })
   await ui.press({ key: 'news-github' })
   expect(asked.filter(url => url !== 'https://news.hada.io/rss/news')).toHaveLength(1)
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+test('claude.dev lists its articles by their own titles', async ($, on) => {
+  world(on, 38, LIMITS, Date.parse('2026-10-18T17:42:00+09:00'))
+  const asked: string[] = []
+  on('http.fetch', (_, e) => {
+    asked.push(e.url)
+
+    return e.url === 'https://claude.dev/rss.xml'
+      ? {
+          value: {
+            status: 200,
+            ok: true,
+            headers: {},
+            text: `<rss version="2.0"><channel><title>claude.dev Blog</title>
+<item><title>Building effective agent automations</title><link>https://claude.dev/blog/automations/</link>
+<pubDate>Thu, 08 Oct 2026 12:00:00 GMT</pubDate><description>A reference implementation walkthrough.</description></item>
+<item><title>Seeing like an agent</title><link>https://claude.dev/blog/tools/</link>
+<pubDate>Thu, 01 Oct 2026 12:00:00 GMT</pubDate><description>How the team designs tools.</description></item>
+</channel></rss>`,
+          },
+        }
+      : { value: { status: 404, ok: false, headers: {}, text: '' } }
+  })
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+  const labels = async () => (await ui.findAll({ type: 'Button' })).map(one => String(one.props.label).trim())
+
+  await ui.press({ key: 'tab-tab8' })
+  await ui.press({ key: 'news-claudedev' })
+  expect(asked.slice(1)).toEqual(['https://claude.dev/rss.xml'])
+  expect(await texts()).toContain('claude.dev 블로그')
+  expect(await labels()).toEqual(expect.arrayContaining(['Building effective agent automations', 'Seeing like an agent']))
+  await ui.press({ key: 'news-claudedev-0' })
+  expect(await texts()).toEqual(expect.arrayContaining(['Building effective agent automations', 'A reference implementation walkthrough.']))
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+// The changelog page in markdown, as code.claude.com gives it.
+const CHANGELOG = `# Claude Code changelog
+
+Run \`claude --version\` to check your installed version.
+
+**2.1.292**
+
+* Fixed \`claude -p\` reporting "Not logged in"
+
+**2.1.291**
+
+**Added**
+
+* Added \`sandbox.allowNestedUserNamespaces\` so sandboxed commands can create namespaces
+* \\[VSCode] Added a spinner
+
+**2 bug fixes**
+
+* Fixed \`/usage\` rows being cut off
+* Fixed a crash
+`
+
+test('the release tab lists the releases of the changelog, marks the one installed and shows its changes', async ($, on) => {
+  world(on, 38, LIMITS, Date.parse('2026-10-18T17:42:00+09:00'))
+  const asked: string[] = []
+  const opened: string[][] = []
+  on('http.fetch', (_, e) => {
+    asked.push(e.url)
+
+    return e.url === 'https://code.claude.com/docs/en/changelog.md'
+      ? { value: { status: 200, ok: true, headers: {}, text: CHANGELOG } }
+      : { value: { status: 404, ok: false, headers: {}, text: '' } }
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'open') {
+      opened.push([...e.argv])
+    }
+
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+
+  // The release installed is picked, its folded headings closed.
+  await ui.press({ key: 'tab-tab9' })
+  expect(asked).toEqual(['https://code.claude.com/docs/en/changelog.md'])
+  expect(await texts()).toEqual(
+    expect.arrayContaining([
+      'Claude Code 변경 내역',
+      '2개 · 17:42 읽음',
+      '항목 1',
+      '추가 2 · 수정 2',
+      '설치됨',
+      '2.1.291 · 4개',
+      '추가 2',
+      '수정 2개 ▸',
+      'Added',
+      'so sandboxed commands can create namespaces',
+      '[VSCode] Added a spinner',
+    ]),
+  )
+  expect(await ui.find({ key: 'release-2.1.292' })).toBeDefined()
+  // Code is drawn apart, without its backticks.
+  const code = (await ui.findAll({ type: 'Text' })).find(one => one.text === 'sandbox.allowNestedUserNamespaces')
+  expect(code?.props.color).toBe('magenta')
+  expect(await texts()).not.toContain('Fixed a crash')
+
+  // A folded heading opens on a press, and closes on another.
+  await ui.press({ key: 'release-fold-수정' })
+  expect(await texts()).toEqual(expect.arrayContaining(['수정 2개 ▾', 'Fixed a crash']))
+  await ui.press({ key: 'release-fold-수정' })
+  expect(await texts()).not.toContain('Fixed a crash')
+
+  // A release of a few changes has no headings.
+  await ui.press({ key: 'release-2.1.292' })
+  expect(await texts()).toEqual(expect.arrayContaining(['2.1.292 · 1개', 'Fixed', 'claude -p', 'reporting "Not logged in"']))
+  await ui.press({ key: 'release-open' })
+  expect(opened).toEqual([['open', 'https://code.claude.com/docs/en/changelog']])
+
+  // Read again within minutes, nothing is fetched; 새로고침 reads it.
+  await ui.press({ key: 'tab-tab1' })
+  await ui.press({ key: 'tab-tab9' })
+  expect(asked).toHaveLength(1)
+  await ui.press({ key: 'release-refresh' })
+  expect(asked).toHaveLength(2)
+  expect(await texts()).toContain('reporting "Not logged in"')
+  await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+test('a long release is paged, and a changelog that fails says so', async ($, on) => {
+  world(on, 38, LIMITS, Date.parse('2026-10-18T17:42:00+09:00'))
+  let isUp = true
+  const markdown = `**2.1.291**\n\n**Added**\n\n${Array.from({ length: 25 }, (_, at) => `* Added thing ${at + 1}`).join('\n')}\n`
+  on('http.fetch', () => ({
+    value: isUp ? { status: 200, ok: true, headers: {}, text: markdown } : { status: 503, ok: false, headers: {}, text: '' },
+  }))
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+
+  await ui.press({ key: 'tab-tab9' })
+  expect(await texts()).toEqual(expect.arrayContaining(['Added thing 23', '1/2']))
+  expect(await texts()).not.toContain('Added thing 24')
+  await ui.press({ key: 'release-detail-next' })
+  expect(await texts()).toEqual(expect.arrayContaining(['Added thing 25', '2/2']))
+
+  // The releases read before stay.
+  isUp = false
+  await ui.press({ key: 'release-refresh' })
+  expect(await texts()).toEqual(expect.arrayContaining(['변경 내역을 읽지 못했습니다(HTTP 503).', 'Added thing 25']))
   await ui.press({ key: 'tab-tab1' })
   await ui.unmount()
 })
@@ -1237,9 +1619,13 @@ test('the docs tab lists the Korean documentation by section and shows the page 
   const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
   const body = async () => (await ui.find({ key: 'docs-text' }))?.props.text as string | undefined
 
-  // The sections with pages, each page once, the groups over them.
-  await ui.press({ key: 'tab-tab10' })
-  expect(asked).toEqual(['https://code.claude.com/docs/_llms/ko.txt'])
+  // The Claude tab opens on its releases; its documentation is the part
+  // beside them. The sections with pages, each page once, the groups over them.
+  await ui.press({ key: 'tab-tab9' })
+  expect(await ui.find({ key: 'claude-release' })).toBeUndefined()
+  await ui.press({ key: 'claude-docs' })
+  expect(await ui.find({ key: 'claude-docs' })).toBeUndefined()
+  expect(asked).toEqual(['https://code.claude.com/docs/en/changelog.md', 'https://code.claude.com/docs/_llms/ko.txt'])
   expect(await texts()).toEqual(
     expect.arrayContaining([
       'Claude Code 문서',
@@ -1306,8 +1692,10 @@ test('the docs tab lists the Korean documentation by section and shows the page 
   expect(await ui.find({ key: 'doc-plugins/overview' })).toBeDefined()
   expect(await ui.find({ key: 'doc-vs-code' })).toBeUndefined()
   const before = asked.length
+  // The part last shown is the one the tab opens on again.
   await ui.press({ key: 'tab-tab1' })
-  await ui.press({ key: 'tab-tab10' })
+  await ui.press({ key: 'tab-tab9' })
+  expect(await ui.find({ key: 'claude-release' })).toBeDefined()
   expect(asked).toHaveLength(before)
   await ui.press({ key: 'docs-refresh' })
   expect(asked.slice(before)).toEqual(['https://code.claude.com/docs/_llms/ko.txt', 'https://code.claude.com/docs/ko/vs-code.md'])
@@ -1330,11 +1718,80 @@ test('a docs index that fails says so and keeps the sections it had', async ($, 
   const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
   const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
 
-  await ui.press({ key: 'tab-tab10' })
+  await ui.press({ key: 'tab-tab9' })
+  await ui.press({ key: 'claude-docs' })
   isUp = false
   await ui.press({ key: 'docs-refresh' })
   expect(await texts()).toContain('문서 목록을 읽지 못했습니다(HTTP 503).')
   expect(await ui.find({ key: 'doc-overview' })).toBeDefined()
   await ui.press({ key: 'tab-tab1' })
+  await ui.unmount()
+})
+
+// The conversation as the next request sends it: a prompt with a reminder,
+// a call and its result.
+const MESSAGES = [
+  {
+    role: 'user',
+    content: [
+      { type: 'text', text: '<system-reminder>\nCLAUDE.md 의 내용\n</system-reminder>' },
+      { type: 'text', text: '컨텍스트 탭 만들어줘' },
+    ],
+  },
+  {
+    role: 'assistant',
+    content: [
+      { type: 'text', text: '파일을 읽겠습니다.' },
+      { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/home/me/work/a.ts' } },
+    ],
+  },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'line one\nline two' }] },
+]
+
+test('the context tab lists the messages newest first and the system prompt, and shows the blocks of the one picked', async ($, on) => {
+  world(on, 38, LIMITS, Date.parse('2026-10-23T09:05:00+09:00'))
+  let asked = 0
+  on('session.messages', () => {
+    asked += 1
+
+    return { value: MESSAGES } as never
+  })
+  on('prompt.compose', () => ({
+    sections: [
+      { id: 'intro', text: 'You are Claude Code.', scope: 'shared' },
+      { id: 'status-panel:note', text: 'A note of the mod.', scope: 'session' },
+    ],
+  }) as never)
+  await $.command.run(RUN)
+  const ui = await $.ui.mount({ plugin: 'status-panel', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 47 } })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(one => one.text.trim())
+
+  await ui.press({ key: 'tab-tab11' })
+  expect(asked).toBe(1)
+  expect(await texts()).toEqual(
+    expect.arrayContaining(['메시지', '3개 · 128자 · 09:05 읽음', '#3', '결과', 'Read line one line two', '#2', 'Claude', '#1', '사용자', '컨텍스트 탭 만들어줘', '위에서 항목을 고르세요.']),
+  )
+  const rows = (await texts()).filter(one => /^#\d$/.test(one))
+  expect(rows).toEqual(['#3', '#2', '#1'])
+
+  // A result is named by the call it answers.
+  await ui.press({ key: 'context-item-#3' })
+  expect(await texts()).toEqual(expect.arrayContaining(['#3 결과 · 블록 1개', '도구 결과 · Read', 'line one', 'line two']))
+
+  // A reminder is told from the words the person wrote.
+  await ui.press({ key: 'context-item-#1' })
+  expect(await texts()).toEqual(expect.arrayContaining(['시스템 알림', '<system-reminder>', 'CLAUDE.md 의 내용', '글', '컨텍스트 탭 만들어줘']))
+  await ui.press({ key: 'context-item-#2' })
+  expect(await texts()).toEqual(expect.arrayContaining(['도구 호출 · Read', '"file_path": "/home/me/work/a.ts"']))
+
+  // The system prompt by its sections.
+  await ui.press({ key: 'context-prompt' })
+  expect(await texts()).toEqual(expect.arrayContaining(['시스템 프롬프트', 'intro', '공통', 'status-panel:no…', '세션', '위에서 항목을 고르세요.']))
+  await ui.press({ key: 'context-item-intro' })
+  expect(await texts()).toEqual(expect.arrayContaining(['You are Claude Code.']))
+
+  // 새로고침 reads it again.
+  await ui.press({ key: 'context-refresh' })
+  expect(asked).toBe(2)
   await ui.unmount()
 })

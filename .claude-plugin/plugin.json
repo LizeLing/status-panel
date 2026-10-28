@@ -1,6 +1,6 @@
 {
   "name": "status-panel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shows the status line's figures (location, model, context, rate limits) in a side pane",
   "types": "./types/index.d.ts",
   "userConfig": {

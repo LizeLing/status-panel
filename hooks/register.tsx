@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren, TurnUsage } from 'claude-code'
 
 import type {
   Account,
@@ -7,6 +7,12 @@ import type {
   Article,
   Breakdown,
   Call,
+  Change,
+  Changelog,
+  Changes,
+  ContextBlock,
+  ContextItem,
+  ContextView,
   Detail,
   DocIndex,
   DocPart,
@@ -22,15 +28,21 @@ import type {
   HarnessItem,
   HarnessScope,
   Hook,
+  Hunks,
   Info,
   Limit,
   NewsView,
+  Release,
+  ReleaseGroup,
+  ReleaseView,
+  Spending,
+  Spent,
   Used,
 } from '../types'
 
 const PANE = 'status-panel'
 const TITLE = 'Status'
-const COLUMNS = 41
+const COLUMNS = 47
 const BEAT_MS = 5000
 const BRIGHT_MAGENTA = '#e58cf5'
 const BRIGHT_BLUE = '#7ab8ff'
@@ -43,6 +55,11 @@ const scope = atom({ plugin: 'status-panel', key: 'scope' } as const, 'global')
 const kind = atom({ plugin: 'status-panel', key: 'kind' } as const, 'memory')
 const NO_USE: Used = { memory: {}, agents: {}, skills: {}, mcp: {}, hooks: {} }
 const used = atom({ plugin: 'status-panel', key: 'used' } as const, NO_USE)
+const NO_SPENDING: Spending = {
+  items: { memory: {}, agents: {}, skills: {}, mcp: {}, hooks: {} },
+  standing: { skills: {}, mcp: {} },
+}
+const spent = atom({ plugin: 'status-panel', key: 'spent' } as const, NO_SPENDING)
 const page = atom({ plugin: 'status-panel', key: 'page' } as const, 0)
 const detail = atom({ plugin: 'status-panel', key: 'detail' } as const, null)
 
@@ -59,21 +76,36 @@ type Tab = { id: string; label: string }
 const HARNESS_TAB = 'tab6'
 const FILES_TAB = 'tab7'
 const NEWS_TAB = 'tab8'
-const DOCS_TAB = 'tab10'
+const CLAUDE_TAB = 'tab9'
+// Where the documentation had a tab of its own, which a state an earlier
+// build left may still hold.
+const OLD_DOCS_TAB = 'tab10'
+const RELEASE_PART = 'release'
+const DOCS_PART = 'docs'
+const CONTEXT_TAB = 'tab11'
 
 // Status, git, the calendar, the harness (what the user's `~/.claude` and the
-// project set up, and what the session did with it), news from a few feeds,
-// the project's files with what the agent did to each, and Claude Code's
-// documentation in Korean.
+// project set up, and what the session did with it), what the model reads in
+// this session, news from a few feeds, and the project's files with what the
+// agent did to each, and Claude Code itself: what each release changed, and
+// its documentation in Korean.
 const TABS: readonly Tab[] = [
   { id: 'tab1', label: '상태' },
   { id: 'tab2', label: 'Git' },
   { id: 'tab5', label: '달력' },
   { id: HARNESS_TAB, label: '하네스' },
+  { id: CONTEXT_TAB, label: '컨텍스트' },
   { id: NEWS_TAB, label: '뉴스' },
   { id: FILES_TAB, label: '파일' },
-  { id: DOCS_TAB, label: '문서' },
+  { id: CLAUDE_TAB, label: 'Claude' },
 ]
+
+// Inside the Claude tab: its releases, and its documentation.
+const CLAUDE_PARTS: readonly Tab[] = [
+  { id: RELEASE_PART, label: '릴리스' },
+  { id: DOCS_PART, label: '문서' },
+]
+const claudePart = atom({ plugin: 'status-panel', key: 'claudePart' } as const, RELEASE_PART)
 
 // Inside the harness tab: a row of scopes, then a row of kinds. After the two
 // scopes come what this session used (of either scope or of neither) and its
@@ -144,6 +176,26 @@ const resetLine = (limit: Limit | undefined, now: number) => {
   const color = left > 172800 ? 'blue' : left > 43200 ? 'yellow' : 'red'
 
   return { text: `초기화 ${when} (${eta} 후)`, color, at, eta }
+}
+
+// The time until a window resets, as the clock shows it beside the face:
+// `02:13` within a day, `3일 04:23` after; null once it has reset.
+const untilLabel = (limit: Limit | undefined, now: number) => {
+  if (limit?.resetsAt === undefined) {
+    return null
+  }
+
+  const left = Math.floor((new Date(limit.resetsAt).getTime() - now) / 60000)
+
+  if (left <= 0) {
+    return null
+  }
+
+  const days = Math.floor(left / 1440)
+  const hours = Math.floor((left % 1440) / 60)
+  const minutes = left % 60
+
+  return days > 0 ? `${days}일 ${two(hours)}:${two(minutes)}` : `${two(hours)}:${two(minutes)}`
 }
 
 // Seven-segment digits in box-drawing strokes, three cells by three rows.
@@ -765,6 +817,8 @@ const FILES_MAX = 20000
 const FILE_ROWS = 20
 const OPS_MAX = 20
 const SCAN_MAX = 300
+// The most lines of a changed file's hunks the files tab shows.
+const DIFF_LINES = 60
 const INDENT_FILES = 12
 
 // Folders a walk of a project that is no git repository stays out of.
@@ -776,6 +830,8 @@ const NO_VIEW: FileView = { filter: 'all', open: [], picked: '', page: 0 }
 const files = atom({ plugin: 'status-panel', key: 'files' } as const, null)
 const touched = atom({ plugin: 'status-panel', key: 'touched' } as const, {})
 const fileView = atom({ plugin: 'status-panel', key: 'fileView' } as const, NO_VIEW)
+const changes = atom({ plugin: 'status-panel', key: 'changes' } as const, null)
+const hunks = atom({ plugin: 'status-panel', key: 'hunks' } as const, null)
 
 // `find` over a project's files, the pruned folders left out; `more` narrows it.
 const findArgs = (root: string, more: string[]) => [
@@ -838,6 +894,150 @@ const readProject = async ($: EngineInterface): Promise<Files | null> => {
   await update($, files, () => next)
 
   return next
+}
+
+// Reads what git sees changed against HEAD: what the index and the working
+// tree hold apart from it, then the files it does not track yet.
+const readChanges = async ($: EngineInterface): Promise<Changes> => {
+  const root = await $.session.root()
+  const git = (args: string[]) =>
+    $.process.run(['git', '-C', root, ...args], { timeoutMs: 10000 }).catch(() => null)
+  let found: Changes = { files: [], error: 'git 저장소가 아닙니다.' }
+
+  if ((await $.session.repo().catch(() => null)) !== null) {
+    const named = await git(['diff', 'HEAD', '--no-renames', '--name-status', '-z'])
+
+    if (named === null || named.exitCode !== 0) {
+      found = { files: [], error: '변경 사항을 읽지 못했습니다. 커밋이 하나도 없을 수 있습니다.' }
+    } else {
+      const counted = await git(['diff', 'HEAD', '--no-renames', '--numstat', '-z'])
+      const fresh = await git(['ls-files', '-z', '--others', '--exclude-standard'])
+      // `--numstat -z` writes `added<TAB>removed<TAB>path`, a binary file's
+      // counts as `-`.
+      const counts = new Map(
+        (counted?.exitCode === 0 ? counted.stdout : '')
+          .split('\0')
+          .filter(one => one.split('\t').length === 3)
+          .map(one => {
+            const [added = '', removed = '', path = ''] = one.split('\t')
+
+            return [path, { added: Number(added), removed: Number(removed) }] as const
+          }),
+      )
+      const parts = named.stdout.split('\0')
+      const files: Change[] = []
+
+      for (let at = 0; at + 1 < parts.length; at += 2) {
+        const code = parts[at] ?? ''
+        const path = parts[at + 1] ?? ''
+        const count = counts.get(path)
+
+        if (path !== '') {
+          files.push({
+            path,
+            op: code.startsWith('A') ? 'C' : code.startsWith('D') ? 'D' : 'U',
+            ...(count !== undefined && !Number.isNaN(count.added) ? count : {}),
+          })
+        }
+      }
+
+      for (const path of (fresh?.exitCode === 0 ? fresh.stdout : '').split('\0')) {
+        if (path !== '') {
+          files.push({ path, op: 'C', isUntracked: true })
+        }
+      }
+
+      found = { files: files.sort((one, other) => one.path.localeCompare(other.path)), error: '' }
+    }
+  }
+
+  await update($, changes, () => found)
+
+  return found
+}
+
+// A hunk cut to its first `room` lines, its header counting what is left.
+const headOf = (hunk: string[], room: number) => {
+  const kept = hunk.slice(1, room)
+  const [, from = '1', to = '1', rest = ''] = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(hunk[0] ?? '') ?? []
+  const old = kept.filter(line => !line.startsWith('+') && !line.startsWith('\\')).length
+  const now = kept.filter(line => !line.startsWith('-') && !line.startsWith('\\')).length
+
+  return [`@@ -${from},${old} +${to},${now} @@${rest}`, ...kept]
+}
+
+// Whole hunks up to the room, so none is drawn cut; a first one longer than
+// the room is cut and its header counted again.
+const clip = (diff: string) => {
+  const lines = diff.replace(/\n$/, '').split('\n')
+  const from = lines.findIndex(line => line.startsWith('@@'))
+  const body = from < 0 ? [] : lines.slice(from)
+  const parts: string[][] = []
+  const kept: string[] = []
+
+  for (const line of body) {
+    if (line.startsWith('@@')) {
+      parts.push([line])
+    } else {
+      parts[parts.length - 1]?.push(line)
+    }
+  }
+
+  for (const hunk of parts) {
+    if (kept.length + hunk.length <= DIFF_LINES) {
+      kept.push(...hunk)
+      continue
+    }
+
+    if (kept.length === 0) {
+      kept.push(...headOf(hunk, DIFF_LINES))
+    }
+
+    break
+  }
+
+  return { text: kept.join('\n'), cut: body.length - kept.length }
+}
+
+// Reads a changed file's hunks: against HEAD, or one git does not track yet
+// against nothing (`--no-index` exits 1 when the two differ).
+const readHunks = async ($: EngineInterface, one: Change) => {
+  const root = await $.session.root()
+  const ran = await $.process
+    .run(
+      [
+        'git',
+        '-C',
+        root,
+        ...(one.isUntracked === true
+          ? ['diff', '--no-color', '--no-index', '--', '/dev/null', one.path]
+          : ['diff', 'HEAD', '--no-color', '--no-renames', '--', one.path]),
+      ],
+      { timeoutMs: 10000 },
+    )
+    .catch(() => null)
+  const found: Hunks = {
+    path: one.path,
+    ...(ran !== null && (ran.exitCode === 0 || ran.exitCode === 1) ? clip(ran.stdout) : { text: '', cut: 0 }),
+  }
+  await update($, hunks, () => found)
+}
+
+// While the files tab shows git's changes, reads them again, and the hunks
+// of the file picked among them.
+const rereadChanges = async ($: EngineInterface) => {
+  const view: FileView = { ...NO_VIEW, ...(await read($, fileView)) }
+
+  if ((await read($, tab)) !== FILES_TAB || view.filter !== 'diff') {
+    return
+  }
+
+  const found = await readChanges($)
+  const picked = found.files.find(one => one.path === view.picked)
+
+  if (picked !== undefined) {
+    await readHunks($, picked)
+  }
 }
 
 // Records what was done to some files, the last few a file kept.
@@ -1044,27 +1244,304 @@ const usesOf = (now: Used, kind: keyof HarnessScope, one: HarnessItem) =>
 
 const times = (count: number) => `${count}회`
 
+// Dollars per million tokens of input, output and cache reads, by the model
+// id's family and version, the most specific first; a cache write costs 1.25
+// times the input. Claude Haiku 5.5's prompts past 100K tokens cost more.
+const PRICES: readonly [string, number, number, number][] = [
+  ['fable-5-1', 10, 50, 0.25],
+  ['mythos-5-1', 10, 50, 0.25],
+  ['fable-5', 10, 50, 1],
+  ['mythos-5', 10, 50, 1],
+  ['opus-5-5', 4, 20, 0.2],
+  ['opus-5', 5, 25, 0.5],
+  ['opus-4', 5, 25, 0.5],
+  ['sonnet-5-5', 2, 10, 0.2],
+  ['sonnet-5', 2, 10, 0.2],
+  ['sonnet-4', 3, 15, 0.3],
+  ['haiku-5-5', 0.1, 0.5, 0.01],
+  ['haiku-4', 1, 5, 0.1],
+]
+
+type Price = { input: number; output: number; write: number; read: number }
+
+// A model's prices per token; none for a model the table does not know.
+const priceOf = (model: string): Price | undefined => {
+  const found = PRICES.find(([name]) => new RegExp(`${name}(?![-.]?\\d)`).test(model))
+
+  return found === undefined
+    ? undefined
+    : { input: found[1] / 1e6, output: found[2] / 1e6, write: (found[1] * 1.25) / 1e6, read: found[3] / 1e6 }
+}
+
+const NO_SPENT: Spent = { input: 0, output: 0, write: 0, read: 0, added: 0, reread: 0, rereads: 0, usd: 0 }
+
+const plus = (one: Spent, other: Spent): Spent => ({
+  input: one.input + other.input,
+  output: one.output + other.output,
+  write: one.write + other.write,
+  read: one.read + other.read,
+  added: one.added + other.added,
+  reread: one.reread + other.reread,
+  rereads: one.rereads + other.rereads,
+  usd: one.usd + other.usd,
+  model: other.model ?? one.model,
+  isSplit: one.isSplit === true || other.isSplit === true ? true : undefined,
+})
+
+// What a piece put into a loop's prompt and has not had taken out since.
+type Held = { kind: keyof HarnessScope; key: string; tokens: number }
+
+// What came into a loop since its last request, to be measured at its next:
+// a piece of the harness (`kind`), or anything else that shares the space.
+type Pending = { kind: keyof HarnessScope | null; key: string; chars: number }
+
+// Each loop by its agent id ('' the main one): the last request's prompt and
+// output tokens, what came in since, and what its prompt holds.
+type Loop = { total: number; output: number; pending: Pending[]; held: Held[] }
+
+const loops = new Map<string, Loop>()
+const loopOf = (id: string) => {
+  const found = loops.get(id) ?? { total: 0, output: 0, pending: [], held: [] }
+  loops.set(id, found)
+
+  return found
+}
+
+// A subagent's type by its id, as its spawn named it.
+const agentTypes = new Map<string, string>()
+// Characters of text per token, as this session's measured pieces showed it:
+// what a piece measured with others alone, or at a turn's start, is put at.
+const ratio = { chars: 0, tokens: 0 }
+const charsPerToken = () => (ratio.tokens < 2000 ? 2.2 : ratio.chars / ratio.tokens)
+// The main loop's requests so far and the model of the last.
+const main = { requests: 0, model: '' }
+// The skill a running Skill call loaded: its text's length and name.
+let skillCall: { chars: number; name?: string } | null = null
+
+// Adds to what pieces took, all in one write.
+const spend = ($: EngineInterface, adds: [keyof HarnessScope, string, Spent][]) =>
+  adds.length === 0
+    ? Promise.resolve()
+    : update($, spent, now => {
+        const items = { ...NO_SPENDING.items, ...now.items }
+
+        for (const [kind, key, add] of adds) {
+          items[kind] = { ...items[kind], [key]: plus(items[kind][key] ?? NO_SPENT, add) }
+        }
+
+        return { ...now, items }
+      }).catch(() => undefined)
+
+// One request of a loop has come back. A subagent's counts are its type's;
+// what came into the loop since its last request is measured by how much its
+// prompt grew past that request's prompt and output; what the prompt held is
+// read once more. At a turn's start the prompt also takes the person's words
+// and drops old thinking, so what came in then is put at its length.
+const measure = ($: EngineInterface, id: string, index: number, usage: TurnUsage) => {
+  const price = priceOf(usage.model)
+  const loop = loopOf(id)
+  const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+  const adds: [keyof HarnessScope, string, Spent][] = []
+  const type = agentTypes.get(id)
+
+  if (id === '') {
+    main.requests += 1
+    main.model = usage.model
+  }
+
+  if (type !== undefined) {
+    const added = usage.input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
+    adds.push([
+      'agents',
+      type,
+      {
+        ...NO_SPENT,
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        write: usage.cache_creation_input_tokens,
+        read: usage.cache_read_input_tokens,
+        added,
+        reread: usage.cache_read_input_tokens,
+        usd:
+          price === undefined
+            ? 0
+            : usage.input_tokens * price.input +
+              usage.output_tokens * price.output +
+              usage.cache_creation_input_tokens * price.write +
+              usage.cache_read_input_tokens * price.read,
+        model: usage.model,
+      },
+    ])
+  }
+
+  // A prompt far smaller than the last was compacted: what it held is gone.
+  if (total < loop.total * 0.6) {
+    loop.held = []
+  }
+
+  for (const one of loop.held) {
+    adds.push([one.kind, one.key, { ...NO_SPENT, reread: one.tokens, rereads: 1, usd: one.tokens * (price?.read ?? 0) }])
+  }
+
+  const grown = total - loop.total - loop.output
+  const isMeasured = index > 0 && loop.total > 0 && grown > 0
+  const chars = loop.pending.reduce((sum, one) => sum + one.chars, 0)
+  const only = loop.pending.length === 1 ? loop.pending[0] : undefined
+
+  if (isMeasured && only !== undefined && only.chars > 200) {
+    ratio.chars += only.chars
+    ratio.tokens += grown
+  }
+
+  for (const one of loop.pending) {
+    const tokens = Math.round(
+      isMeasured ? (only !== undefined ? grown : chars === 0 ? 0 : (grown * one.chars) / chars) : one.chars / charsPerToken(),
+    )
+
+    if (one.kind !== null && tokens > 0) {
+      adds.push([
+        one.kind,
+        one.key,
+        { ...NO_SPENT, added: tokens, usd: tokens * (price?.write ?? 0), isSplit: isMeasured && only !== undefined ? undefined : true },
+      ])
+      loop.held.push({ kind: one.kind, key: one.key, tokens })
+    }
+  }
+
+  loop.pending = []
+  loop.total = total
+  loop.output = usage.output_tokens
+
+  return spend($, adds)
+}
+
+// What the full /context count says each instruction file, the skill listing
+// and each server's tool schemas hold. The files count from here on as held
+// by the main loop, and as read by each of its requests so far.
+let isCounted = false
+const countStanding = async ($: EngineInterface) => {
+  if (isCounted) {
+    return
+  }
+
+  isCounted = true
+  const found = (await $.session.usage({ breakdown: 'full' })).context.breakdown
+
+  if (found === undefined) {
+    isCounted = false
+
+    return
+  }
+
+  const price = priceOf(main.model)
+  const before = Math.max(0, main.requests - 1)
+  const loop = loopOf('')
+  const adds: [keyof HarnessScope, string, Spent][] = (found.memoryFiles ?? []).map(one => {
+    loop.held.push({ kind: 'memory', key: one.path, tokens: one.tokens })
+
+    return [
+      'memory',
+      one.path,
+      {
+        ...NO_SPENT,
+        added: one.tokens,
+        reread: one.tokens * before,
+        rereads: before,
+        usd: one.tokens * ((price?.write ?? 0) + (price?.read ?? 0) * before),
+      },
+    ]
+  })
+  const mcp: Record<string, number> = {}
+
+  for (const one of (found.mcpTools ?? []).filter(each => each.isLoaded)) {
+    mcp[spelled(one.serverName)] = (mcp[spelled(one.serverName)] ?? 0) + one.tokens
+  }
+
+  const skills = Object.fromEntries((found.skills?.skillFrontmatter ?? []).map(one => [one.name, one.tokens]))
+  await update($, spent, now => ({ ...now, standing: { skills, mcp } })).catch(() => undefined)
+  await spend($, adds)
+}
+
+const dollars = (usd: number) => (usd === 0 ? '-' : usd < 0.01 ? '<$0.01' : `$${usd.toFixed(2)}`)
+const amount = (one: Spent) => `${one.isSplit === true ? '≈' : ''}${tokens(one.added)}`
+
+// What a piece took, summed over its keys; none when it took nothing.
+const spentOf = (all: Record<string, Spent>, keys: string[]) => {
+  const found = keys.map(key => all[key]).filter((one): one is Spent => one !== undefined)
+
+  // The same requests read each key again: they are counted once.
+  return found.length === 0
+    ? undefined
+    : found.reduce((sum, one) => ({ ...plus(sum, one), rereads: Math.max(sum.rereads, one.rereads) }), NO_SPENT)
+}
+
+// The note of a used item's row, and its rows of tokens in the details.
+const noted = (count: number, one: Spent | undefined) =>
+  one === undefined || one.added === 0 ? times(count) : `${times(count)} · ${amount(one)}`
+
+const costsOf = (kind: keyof HarnessScope, one: Spent | undefined, standing?: [string, number]): [string, string][] => {
+  const shared: [string, string][] =
+    one === undefined
+      ? []
+      : [
+          [kind === 'memory' ? '상주' : '새로 처리', amount(one)],
+          ['토큰 합', tokens(one.added + one.reread)],
+          ['비용', dollars(one.usd)],
+        ]
+  const own: [string, string][] =
+    one === undefined
+      ? []
+      : kind === 'agents'
+        ? [
+            ['입력', tokens(one.input)],
+            ['출력', tokens(one.output)],
+            ['캐시 쓰기', tokens(one.write)],
+            ['캐시 읽기', tokens(one.read)],
+            ['모델', (one.model ?? '').replace(/^claude-/, '')],
+          ]
+        : [['다시 읽음', times(one.rereads)]]
+
+  return [...shared, ...own, ...(standing === undefined ? [] : [[standing[0], tokens(standing[1])] as [string, string]])]
+}
+
 // What this session used of a kind, as items: those the lists hold keep their
 // file to preview, and one they do not (a plugin's, a connector) says so.
-const usedItems = (now: Used, kind: keyof HarnessScope, found: Harness | null): HarnessItem[] => {
+// Each notes the tokens it took next to its count.
+const usedItems = (now: Used, kind: keyof HarnessScope, found: Harness | null, paid: Spending): HarnessItem[] => {
   const known = found === null ? [] : [...found.global[kind], ...found.project[kind]]
+  const all = paid.items[kind] ?? {}
 
   if (kind === 'memory') {
-    return Object.entries(now.memory).map(([path, count]) => ({ name: short(path), note: times(count), path }))
+    return Object.entries(now.memory).map(([path, count]) => ({
+      name: short(path),
+      note: noted(count, all[path]),
+      costs: costsOf(kind, all[path]),
+      path,
+    }))
   }
 
   if (kind === 'mcp') {
     const servers = [...new Set(Object.keys(now.mcp).map(key => key.split('\t')[0] ?? ''))]
 
-    return servers.map(server => ({
-      path: known.find(one => spelled(one.name) === server)?.path,
-      name: known.find(one => spelled(one.name) === server)?.name ?? server,
-      note: times(serverCalls(now.mcp, server)),
-      lines: Object.entries(now.mcp)
-        .filter(([key]) => key.split('\t')[0] === server)
-        .sort((one, other) => other[1] - one[1])
-        .map(([key, count]) => `${key.split('\t')[1] ?? ''} · ${times(count)}`),
-    }))
+    return servers.map(server => {
+      const keys = Object.keys(now.mcp).filter(key => key.split('\t')[0] === server)
+      const taken = spentOf(all, keys)
+      const schemas = paid.standing.mcp[server]
+
+      return {
+        path: known.find(one => spelled(one.name) === server)?.path,
+        name: known.find(one => spelled(one.name) === server)?.name ?? server,
+        note: noted(serverCalls(now.mcp, server), taken),
+        costs: costsOf(kind, taken, schemas === undefined ? undefined : ['스키마 상주', schemas]),
+        lines: keys
+          .sort((one, other) => (now.mcp[other] ?? 0) - (now.mcp[one] ?? 0))
+          .map(key => {
+            const each = all[key]
+
+            return `${key.split('\t')[1] ?? ''} · ${noted(now.mcp[key] ?? 0, each)}`
+          }),
+      }
+    })
   }
 
   if (kind === 'hooks') {
@@ -1079,18 +1556,27 @@ const usedItems = (now: Used, kind: keyof HarnessScope, found: Harness | null): 
           path: known.find(one => one.name === event)?.path,
           count: hookRuns(now.hooks, event, hooks.map(one => one.matcher)),
           hooks: hooks.map(one => ({ ...one, count: hookRuns(now.hooks, event, [one.matcher]) })),
+          taken: spentOf(all, Object.keys(all).filter(key => key.split('\t')[0] === event)),
         }
       })
       .filter(one => one.count > 0)
-      .map(one => ({ name: one.name, note: times(one.count), hooks: one.hooks, path: one.path }))
+      .map(one => ({
+        name: one.name,
+        note: noted(one.count, one.taken),
+        costs: costsOf(kind, one.taken),
+        hooks: one.hooks,
+        path: one.path,
+      }))
   }
 
   return Object.entries(now[kind]).map(([name, count]) => {
     const path = known.find(one => one.name.replace(/^\//, '') === name)?.path
+    const listing = kind === 'skills' ? paid.standing.skills[name] : undefined
+    const costs = costsOf(kind, all[name], listing === undefined ? undefined : ['목록 상주', listing])
 
     return path === undefined
-      ? { name, note: times(count), lines: ['목록에 없는 항목입니다.'] }
-      : { name, note: times(count), path }
+      ? { name, note: noted(count, all[name]), costs, lines: ['목록에 없는 항목입니다.'] }
+      : { name, note: noted(count, all[name]), costs, path }
   })
 }
 
@@ -1204,6 +1690,8 @@ const watch = async ($: EngineInterface) => {
   if ((await read($, tab)) !== HARNESS_TAB) {
     return
   }
+
+  void countStanding($).catch(() => undefined)
 
   if ((await readStamp($)) !== stamp) {
     harness = await readHarness($).catch(() => harness)
@@ -1434,8 +1922,6 @@ const SOURCES: readonly (Tab & { url: string; heading?: string; isTrending?: boo
 const NEWS_ROWS = 10
 const NEWS_FRESH_MS = 10 * 60 * 1000
 const ARTICLES_MAX = 50
-const SUMMARY_CHARS = 300
-const SUMMARY_ROWS = 4
 const AGE_CELLS = 6
 const NO_NEWS_VIEW: NewsView = { source: 'geeknews', page: 0, picked: '' }
 
@@ -1505,7 +1991,7 @@ const parseFeed = (xml: string): Article[] =>
       return {
         title: textOf(element(block, ['title'])),
         link: unescape(link.trim()),
-        summary: summary.length > SUMMARY_CHARS ? `${summary.slice(0, SUMMARY_CHARS)}…` : summary,
+        summary,
         at: dateOf(textOf(element(block, ['pubDate', 'published', 'updated', 'dc:date']))),
       }
     })
@@ -1543,7 +2029,7 @@ const parseTrending = (page: string): Article[] =>
       return {
         title: repo,
         link: `https://github.com/${repo}`,
-        summary: words.length > SUMMARY_CHARS ? `${words.slice(0, SUMMARY_CHARS)}…` : words,
+        summary: words,
         at: NaN,
         aside: gained(today),
         meta: [language, stars === '' ? '' : `★${stars}`, today === '' ? '' : `오늘 +${today}`].filter(one => one !== '').join(' · '),
@@ -1594,6 +2080,26 @@ const readFeed = async ($: EngineInterface, id: string, isForced: boolean) => {
   }
 }
 
+// Claude Code's changelog, as the documentation's page gives it in markdown:
+// a release under its version in bold, its changes in bullets under a bold
+// heading or none.
+const CHANGELOG_URL = 'https://code.claude.com/docs/en/changelog'
+const RELEASES_MAX = 50
+const RELEASE_ROWS = 10
+const VERSION_CELLS = 9
+// A heading's name by its words; the last two are folded until pressed, as
+// the page folds them.
+const KINDS: readonly (readonly [RegExp, string])[] = [
+  [/^Added/, '추가'],
+  [/^Changed/, '변경'],
+  [/improve/i, '개선'],
+  [/fix/i, '수정'],
+]
+const FOLDED = ['개선', '수정']
+const NO_RELEASE_VIEW: ReleaseView = { page: 0, picked: '', detailPage: 0, opened: [] }
+const changelog = atom({ plugin: 'status-panel', key: 'changelog' } as const, null)
+const releaseView = atom({ plugin: 'status-panel', key: 'releaseView' } as const, NO_RELEASE_VIEW)
+
 // A change as plain words with its code still in backticks: a mark escaped
 // outside code is the mark itself, and an escaped backtick a quote, so the
 // backticks left pair up.
@@ -1617,6 +2123,74 @@ const unmark = (text: string) => {
   }
 
   return plain
+}
+
+// The latest releases, newest first.
+const parseChangelog = (markdown: string) => {
+  const releases: Release[] = []
+  let group: ReleaseGroup | undefined
+
+  for (const line of markdown.split('\n')) {
+    const heading = /^\*\*(.+)\*\*\s*$/.exec(line)?.[1]
+    const release = releases[releases.length - 1]
+
+    if (heading !== undefined && /^\d+\.\d+\.\d+$/.test(heading)) {
+      if (releases.length === RELEASES_MAX) {
+        break
+      }
+
+      releases.push({ version: heading, groups: [] })
+      group = undefined
+    } else if (heading !== undefined && release !== undefined) {
+      group = { kind: KINDS.find(([words]) => words.test(heading))?.[1] ?? heading, items: [] }
+      release.groups.push(group)
+    } else if (release !== undefined && line.startsWith('* ')) {
+      if (group === undefined) {
+        group = { kind: '', items: [] }
+        release.groups.push(group)
+      }
+
+      group.items.push(unmark(line.slice(2).trim()))
+    }
+  }
+
+  return releases.filter(one => one.groups.length > 0)
+}
+
+// How many changes a release has under each heading.
+const countsOf = (release: Release, between = ' · ') =>
+  release.groups.map(one => `${one.kind || '항목'} ${one.items.length}`).join(between)
+
+// Reads the changelog, unless it was read well within the last minutes; one
+// that fails keeps the releases it had and says what went wrong.
+const readChangelog = async ($: EngineInterface, isForced: boolean) => {
+  const held = await read($, changelog)
+  const now = await $.clock.now()
+
+  if (reading.has(RELEASE_PART) || (!isForced && held !== null && held.error === '' && now - held.readAt < NEWS_FRESH_MS)) {
+    return
+  }
+
+  reading.add(RELEASE_PART)
+
+  try {
+    const got = await $.http.fetch(`${CHANGELOG_URL}.md`).catch(() => null)
+    const releases = got?.ok === true ? parseChangelog(got.text) : []
+    const error =
+      got === null
+        ? '변경 내역을 읽지 못했습니다.'
+        : !got.ok
+          ? `변경 내역을 읽지 못했습니다(HTTP ${got.status}).`
+          : releases.length === 0
+            ? '변경 내역에 버전이 없습니다.'
+            : ''
+
+    await update($, changelog, standing =>
+      error === '' ? { releases, readAt: now, error } : { releases: standing?.releases ?? [], readAt: standing?.readAt ?? 0, error },
+    )
+  } finally {
+    reading.delete(RELEASE_PART)
+  }
 }
 
 // Claude Code's documentation in Korean: the index the site gives for it (a
@@ -1791,11 +2365,11 @@ const readDocIndex = async ($: EngineInterface, isForced: boolean) => {
   const held = await read($, docIndex)
   const now = await $.clock.now()
 
-  if (reading.has(DOCS_TAB) || (!isForced && held !== null && held.error === '' && now - held.readAt < NEWS_FRESH_MS)) {
+  if (reading.has(DOCS_PART) || (!isForced && held !== null && held.error === '' && now - held.readAt < NEWS_FRESH_MS)) {
     return
   }
 
-  reading.add(DOCS_TAB)
+  reading.add(DOCS_PART)
 
   try {
     const got = await $.http.fetch(DOCS_INDEX_URL).catch(() => null)
@@ -1813,7 +2387,7 @@ const readDocIndex = async ($: EngineInterface, isForced: boolean) => {
       error === '' ? { sections, readAt: now, error } : { sections: standing?.sections ?? [], readAt: standing?.readAt ?? 0, error },
     )
   } finally {
-    reading.delete(DOCS_TAB)
+    reading.delete(DOCS_PART)
   }
 }
 
@@ -1876,8 +2450,183 @@ const pickDoc = async ($: EngineInterface, slug: string) => {
   void readDocPage($, slug, false).catch(() => undefined)
 }
 
+// What a part of the Claude tab shows, read when the part is opened unless it
+// is fresh: the changelog, or the documentation's index and the page open.
+const readClaudePart = async ($: EngineInterface, part: string, picked: string) => {
+  if (part === RELEASE_PART) {
+    await readChangelog($, false).catch(() => undefined)
+
+    return
+  }
+
+  await readDocIndex($, false).catch(() => undefined)
+
+  if (picked !== '') {
+    await readDocPage($, picked, false).catch(() => undefined)
+  }
+}
+
+// The context as the model reads it: the conversation's messages as the next
+// request sends them (the last compaction's summary in place of what it
+// replaced, reminders as words), and the system prompt's sections. The tool
+// list is not among them; the status tab's breakdown counts it.
+const CONTEXT_ROWS = 10
+const CONTEXT_CHARS = 60000
+const PREVIEW_MAX = 120
+const PARTS: readonly Tab[] = [
+  { id: 'messages', label: '메시지' },
+  { id: 'prompt', label: '시스템 프롬프트' },
+]
+const TONES: Record<string, { label: string; color?: string }> = {
+  user: { label: '사용자', color: 'green' },
+  result: { label: '결과' },
+  assistant: { label: 'Claude', color: 'cyan' },
+  shared: { label: '공통' },
+  session: { label: '세션', color: 'yellow' },
+}
+const NO_CONTEXT_VIEW: ContextView = { part: 'messages', page: 0, picked: '', detailPage: 0 }
+const contextRead = atom({ plugin: 'status-panel', key: 'contextRead' } as const, null)
+const contextView = atom({ plugin: 'status-panel', key: 'contextView' } as const, NO_CONTEXT_VIEW)
+// The entries last read, newest message first; they start over with the
+// module, and the tab reads them again when it finds none.
+let context: { messages: ContextItem[]; sections: ContextItem[] } | null = null
+
+type Block = { type: string; [field: string]: unknown }
+
+const isBlock = (value: unknown): value is Block =>
+  typeof value === 'object' && value !== null && typeof (value as { type?: unknown }).type === 'string'
+
+// A tool result's content in words: as given, or its blocks', media named.
+const wordsOf = (content: unknown): string =>
+  typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content
+          .filter(isBlock)
+          .map(one => (one.type === 'text' && typeof one.text === 'string' ? one.text : `[${one.type}]`))
+          .join('\n')
+      : ''
+
+// A text cut to what a block shows, saying how much is left out.
+const capped = (text: string) =>
+  text.length <= CONTEXT_CHARS ? text : `${text.slice(0, CONTEXT_CHARS)}\n… ${text.length - CONTEXT_CHARS}자 생략`
+
+// A message's block as the tab draws it: what kind it is, and its words. A
+// tool's result is named by the call it answers.
+const contextBlock = (one: Block, tools: Map<string, string>): ContextBlock => {
+  const said = typeof one.text === 'string' ? one.text : ''
+  const name = typeof one.name === 'string' ? one.name : ''
+
+  if (one.type === 'text') {
+    return { title: said.trimStart().startsWith('<system-reminder>') ? '시스템 알림' : '글', text: said }
+  }
+
+  if (one.type === 'tool_use' || one.type === 'server_tool_use') {
+    return { title: `도구 호출 · ${name}`, text: JSON.stringify(one.input ?? {}, null, 2) }
+  }
+
+  if (one.type === 'tool_result') {
+    const tool = tools.get(typeof one.tool_use_id === 'string' ? one.tool_use_id : '') ?? ''
+
+    return { title: `도구 결과${tool === '' ? '' : ` · ${tool}`}${one.is_error === true ? ' · 오류' : ''}`, text: wordsOf(one.content) }
+  }
+
+  if (one.type === 'thinking') {
+    return { title: '생각', text: typeof one.thinking === 'string' ? one.thinking : '' }
+  }
+
+  if (one.type === 'redacted_thinking') {
+    return { title: '생각(암호화됨)', text: '' }
+  }
+
+  if (one.type === 'image' || one.type === 'document') {
+    const source = isBlock(one.source) ? one.source : null
+    const kind = typeof source?.media_type === 'string' ? source.media_type : (source?.type ?? '')
+    const title = typeof one.title === 'string' ? one.title : ''
+
+    return { title: one.type === 'image' ? '이미지' : '문서', text: [title, kind].filter(part => part !== '').join(' · ') }
+  }
+
+  // Any other kind as it is held, its long values left out.
+  return {
+    title: one.type,
+    text: JSON.stringify(one, (key, value: unknown) => (key !== '' && typeof value === 'string' && value.length > 400 ? `${value.slice(0, 400)}…` : value), 2),
+  }
+}
+
+const previewOf = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, PREVIEW_MAX)
+
+// Reads the messages and the system prompt again; what fails keeps what was
+// read before and says what went wrong.
+const readContext = async ($: EngineInterface) => {
+  if (reading.has(CONTEXT_TAB)) {
+    return
+  }
+
+  reading.add(CONTEXT_TAB)
+
+  try {
+    const [messages, composed, now] = await Promise.all([
+      $.session.messages({ as: 'api' }).catch(() => null),
+      $.prompt.compose().catch(() => null),
+      $.clock.now(),
+    ])
+    // Each call's tool, so a result is named by the call it answers.
+    const tools = new Map(
+      (messages ?? []).flatMap(one =>
+        one.content.flatMap(block =>
+          block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string' ? [[block.id, block.name] as const] : [],
+        ),
+      ),
+    )
+    const listed: ContextItem[] = (messages ?? []).map((one, index) => {
+      const blocks = one.content.map(block => contextBlock(block, tools)).map(block => ({ ...block, text: capped(block.text) }))
+      const isResult = one.role === 'user' && one.content.length > 0 && one.content.every(block => block.type === 'tool_result')
+      // What the row shows first: the words of the message, a reminder's when
+      // it has no others, else its first call or result under the tool's name.
+      const words =
+        blocks.find(block => block.title === '글' && block.text.trim() !== '') ??
+        blocks.find(block => block.title === '시스템 알림' && block.text.trim() !== '')
+      const first = words ?? blocks[0]
+      const lead = first === undefined || first === words ? '' : `${first.title.split(' · ')[1] ?? first.title} `
+
+      return {
+        name: `#${index + 1}`,
+        tone: isResult ? 'result' : one.role,
+        preview: previewOf(`${lead}${first?.text ?? ''}`),
+        chars: blocks.reduce((sum, block) => sum + block.text.length, 0),
+        blocks,
+      }
+    })
+    const sections: ContextItem[] = (composed?.sections ?? []).map(one => ({
+      name: one.id,
+      tone: one.scope,
+      preview: previewOf(one.text),
+      chars: one.text.length,
+      blocks: [{ title: one.id, text: capped(one.text) }],
+    }))
+    const error =
+      messages === null && composed === null
+        ? '컨텍스트를 읽지 못했습니다.'
+        : messages === null
+          ? '메시지를 읽지 못했습니다.'
+          : composed === null
+            ? '시스템 프롬프트를 읽지 못했습니다.'
+            : ''
+
+    context = {
+      messages: messages === null ? (context?.messages ?? []) : listed.reverse(),
+      sections: composed === null ? (context?.sections ?? []) : sections,
+    }
+    await update($, contextRead, () => ({ readAt: now, messages: context?.messages.length ?? 0, sections: context?.sections.length ?? 0, error }))
+  } finally {
+    reading.delete(CONTEXT_TAB)
+  }
+}
+
 const OPEN = '[열기]'
 const SEND = '[세션에 넣기]'
+const RELOAD = '[다시 읽기]'
 
 // Hands an item's file to an app by name, or with none to the system's own.
 const openFile = async ($: EngineInterface, one: HarnessItem, app: string) => {
@@ -1951,6 +2700,24 @@ export const register: Register = (on, options) => {
     return { text: opened.isPlaced ? 'Status pane opened.' : `Status pane waits: ${opened.reason}` }
   })
 
+  // /diff shows git's changes under the files tab's 바뀐 것, so the engine's
+  // diff panel does not cover the pane; where the pane cannot be placed, the
+  // engine's panel opens as before.
+  on('command.run', { command: 'diff' }, async ($, e, next) => {
+    const opened = await $.ui.open({ id: PANE, title: TITLE, columns: COLUMNS })
+
+    if (!opened.isPlaced) {
+      return next(e)
+    }
+
+    await update($, tab, () => FILES_TAB)
+    await update($, fileView, now => ({ ...NO_VIEW, ...now, filter: 'diff', page: 0 }))
+    await readProject($).catch(() => undefined)
+    await rereadChanges($).catch(() => undefined)
+
+    return { text: 'Changes opened in the status pane.' }
+  })
+
   on('ui.close', async ($, e, next) => {
     const closed = await next(e)
 
@@ -1966,7 +2733,14 @@ export const register: Register = (on, options) => {
       effort = String(e.effort)
     }
 
-    return yield* next(e)
+    const done = yield* next(e)
+
+    // What the request cost, and what came into its loop before it.
+    if (done.usage !== null) {
+      void measure($, e.agentId ?? '', e.index, done.usage).catch(() => undefined)
+    }
+
+    return done
   })
 
   on('tool.call', async ($, e, next) => {
@@ -1990,8 +2764,31 @@ export const register: Register = (on, options) => {
     const target = named === null ? null : within(root, named)
     const isNew = e.tool === 'Write' && target !== null && !(await $.fs.exists(`${root}/${target}`).catch(() => true))
     const since = await $.clock.now().catch(() => 0)
+    const isSkill = e.tool === 'Skill'
+
+    if (isSkill) {
+      skillCall = { chars: 0 }
+    }
+
+    const loaded = skillCall
     const ran = await next(e)
     const state: Call['state'] = ran.deny !== undefined || ran.isError === true ? 'err' : 'ok'
+    // Its result comes into its loop's next request: an MCP server's tool or
+    // a skill's text there is a piece of the harness, anything else shares the
+    // growth with them.
+    const chars = (ran.text?.length ?? ran.deny?.length ?? 0) + (isSkill ? (loaded?.chars ?? 0) : 0)
+    const skill = e.tool === 'Skill' ? (loaded?.name ?? e.skill) : undefined
+    loopOf(e.agentId ?? '').pending.push(
+      server !== undefined
+        ? { kind: 'mcp', key: `${server}\t${name.join('__')}`, chars }
+        : skill !== undefined
+          ? { kind: 'skills', key: skill, chars }
+          : { kind: null, key: e.tool, chars },
+    )
+
+    if (isSkill && skillCall === loaded) {
+      skillCall = null
+    }
 
     if (state === 'ok' && target !== null) {
       void noteOps($, [[target, { op: e.tool === 'Read' ? 'R' : isNew ? 'C' : 'U', at: since, tool: e.tool }]])
@@ -1999,11 +2796,18 @@ export const register: Register = (on, options) => {
       if (isNew) {
         void readProject($).catch(() => undefined)
       }
+
+      if (e.tool !== 'Read') {
+        void rereadChanges($).catch(() => undefined)
+      }
     }
 
     // A shell command is compared across, one at a time and never waited on.
     if (e.tool === 'Bash' && ran.deny === undefined) {
-      scans = scans.then(() => scan($, since, e.tool)).catch(() => undefined)
+      scans = scans
+        .then(() => scan($, since, e.tool))
+        .then(() => rereadChanges($))
+        .catch(() => undefined)
     }
 
     await update($, activity, now => ({
@@ -2014,27 +2818,41 @@ export const register: Register = (on, options) => {
     return ran
   })
 
+  // A subagent's requests are its type's, known by the id it started under.
   on('agent.spawn', async ($, e, next) => {
     void bump($, 'agents', e.subagentType)
+    const started = await next(e)
 
-    return next(e)
+    if (started.agentId !== undefined) {
+      agentTypes.set(started.agentId, e.subagentType)
+    }
+
+    return started
   })
 
+  // A skill the Skill tool loads comes in with the call's result; one typed
+  // as a command comes in with the person's words, put at its length.
   on('skill.prompt', async ($, e, next) => {
     void bump($, 'skills', e.skill)
+    const loaded = await next(e)
 
-    return next(e)
+    if (skillCall !== null) {
+      skillCall.chars += loaded.text.length
+      skillCall.name = e.skill
+    } else {
+      loopOf('').pending.push({ kind: 'skills', key: e.skill, chars: loaded.text.length })
+    }
+
+    return loaded
   })
 
   // A classic event counts toward the settings hooks on it, when the settings
   // have any (the rest change no state); a load of an instruction file also
   // marks the file. The counting is never waited on: the event goes straight on.
+  // What the settings hooks add to the conversation comes into the loop the
+  // event fired in, measured at its next request.
   on('classic.*', ($, e, next) => {
     const event = next.event.slice('classic.'.length)
-
-    if ([...(harness?.global.hooks ?? []), ...(harness?.project.hooks ?? [])].some(one => one.name === event)) {
-      void bump($, 'hooks', `${event}\t${subjectOf(e)}`)
-    }
 
     if (event === 'InstructionsLoaded') {
       const load = e as { file_path?: string; load_reason?: string }
@@ -2044,12 +2862,33 @@ export const register: Register = (on, options) => {
       }
     }
 
+    if ([...(harness?.global.hooks ?? []), ...(harness?.project.hooks ?? [])].some(one => one.name === event)) {
+      const key = `${event}\t${subjectOf(e)}`
+      void bump($, 'hooks', key)
+
+      return Promise.resolve(next(e)).then(done => {
+        const added = (done as { additionalContext?: unknown }).additionalContext
+        const id = (e as { agent_id?: unknown }).agent_id
+
+        if (typeof added === 'string' && added !== '') {
+          loopOf(typeof id === 'string' ? id : '').pending.push({ kind: 'hooks', key, chars: added.length })
+        }
+
+        return done
+      })
+    }
+
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     await update($, activity, now => ({ ...now, lastTurnMs: e.durationMs })).catch(() => undefined)
     await refresh($, true).catch(() => undefined)
+
+    // What the turn added to the context, while its tab is shown.
+    if ((await read($, tab)) === CONTEXT_TAB) {
+      void readContext($).catch(() => undefined)
+    }
 
     return next(e)
   })
@@ -2067,10 +2906,12 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Markdown, Text } = $.ui.resolve(e)
+    const { Box, Button, Code, Markdown, Text } = $.ui.resolve(e)
     const now = await read($, info)
     const held = await read($, tab)
-    const shown = TABS.some(one => one.id === held) ? held : 'tab1'
+    const shown = held === OLD_DOCS_TAB ? CLAUDE_TAB : TABS.some(one => one.id === held) ? held : 'tab1'
+    const heldPart = held === OLD_DOCS_TAB ? DOCS_PART : await read($, claudePart)
+    const claudeAt = CLAUDE_PARTS.some(one => one.id === heldPart) ? heldPart : RELEASE_PART
     const heldScope = await read($, scope)
     const heldKind = await read($, kind)
     const area = SCOPES.find(one => one.id === heldScope) ?? SCOPES[0]
@@ -2079,14 +2920,21 @@ export const register: Register = (on, options) => {
     const heldPage = await read($, page)
     // State an earlier build of the mod left may lack what this one added.
     const uses: Used = { ...NO_USE, ...(await read($, used)) }
+    const paid: Spending = { ...NO_SPENDING, ...(await read($, spent)) }
     const project = await read($, files)
     const marks = (await read($, touched)) ?? {}
     const view: FileView = { ...NO_VIEW, ...(await read($, fileView)) }
+    const changed = await read($, changes)
+    const diffed = await read($, hunks)
     const feeds = (await read($, news)) ?? {}
     const newsAt: NewsView = { ...NO_NEWS_VIEW, ...(await read($, newsView)) }
+    const notes = await read($, changelog)
+    const releaseAt: ReleaseView = { ...NO_RELEASE_VIEW, ...(await read($, releaseView)) }
     const docList = await read($, docIndex)
     const texts = await read($, docTexts)
     const docAt: DocView = { ...NO_DOC_VIEW, ...(await read($, docView)) }
+    const contextGot = await read($, contextRead)
+    const contextAt: ContextView = { ...NO_CONTEXT_VIEW, ...(await read($, contextView)) }
     const isFirst = shown === 'tab1'
     const acts = await read($, activity)
     const AGENT_COLORS: Record<string, string> = {
@@ -2115,6 +2963,24 @@ export const register: Register = (on, options) => {
     const hours = bigDigits(two(today.getHours()))
     const minutes = bigDigits(two(today.getMinutes()))
     const faceGap = Math.floor((room - FACE_CELLS) / 2)
+    // The session window beside the face on the left, the week on the right:
+    // a label over the time left, or one row beneath when the sides are narrow.
+    const fiveHour = now.limits.find(one => one.kind === 'five_hour')
+    const sides = [
+      { label: '세션', limit: fiveHour },
+      { label: '주간', limit: sevenDay },
+    ].flatMap(({ label, limit }) => {
+      const value = untilLabel(limit, now.now)
+
+      return value === null || limit === undefined
+        ? []
+        : [{ label, value, color: colorForLeft(100 - limit.percentUsed), isLeft: label === '세션' }]
+    })
+    const sideRoom = Math.min(faceGap, room - faceGap - FACE_CELLS) - 2
+    const isBeside = sides.every(one => Math.max(cells(one.label), cells(one.value)) <= sideRoom)
+    const leftSide = sides.find(one => one.isLeft)
+    const rightSide = sides.find(one => !one.isLeft)
+    const belowText = sides.map(one => `${one.label} ${one.value}`).join(' · ')
     const pad = (text: string, size: number) => text + ' '.repeat(Math.max(0, size - cells(text)))
     const centre = (text: string) => ' '.repeat(Math.max(0, Math.floor((room - cells(text)) / 2))) + text
 
@@ -2159,10 +3025,18 @@ export const register: Register = (on, options) => {
       area === undefined || section === undefined
         ? []
         : area.id === 'used'
-          ? usedItems(uses, section.id, now.harness ?? null)
+          ? usedItems(uses, section.id, now.harness ?? null, paid)
           : area.id === 'activity'
             ? []
             : (now.harness?.[area.id]?.[section.id] ?? [])
+    // An item's key, by where it is listed: what its buttons and details go by.
+    const keyOf = (one: HarnessItem) =>
+      [area?.id, section?.id, one.group?.replace(/\/$/, ''), one.name].filter(part => part !== undefined).join('/')
+    // Of what was used, the tokens the kind took in all.
+    const took =
+      area?.id === 'used' && section !== undefined
+        ? Object.values(paid.items[section.id] ?? {}).reduce((sum, one) => sum + one.added, 0)
+        : 0
     // Whether the session used anything a scope lists of a kind: what marks
     // the scope's tab and, in the scope shown, the kind's.
     const isUsedIn = (scopeId: string, kindId: string) => {
@@ -2172,7 +3046,7 @@ export const register: Register = (on, options) => {
         ? false
         : scopeId === 'global' || scopeId === 'project'
           ? (now.harness?.[scopeId]?.[kindOf] ?? []).some(one => usesOf(uses, kindOf, one) > 0)
-          : scopeId === area?.id && usedItems(uses, kindOf, now.harness ?? null).length > 0
+          : scopeId === area?.id && usedItems(uses, kindOf, now.harness ?? null, paid).length > 0
     }
     // Those under the kind's own heading; the rest are in sections of their own.
     const own = items.filter(one => one.group === undefined)
@@ -2250,9 +3124,7 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="column">
           {items.slice(at * LIST_ROWS, (at + 1) * LIST_ROWS).map((one, index, drawn) => {
-            const key = [area?.id, section?.id, one.group?.replace(/\/$/, ''), one.name]
-              .filter(part => part !== undefined)
-              .join('/')
+            const key = keyOf(one)
             // A section of its own opens where the page comes to its first item.
             const isOpening = one.group !== undefined && one.group !== drawn[index - 1]?.group
             const isPicked = opened?.key === key
@@ -2311,11 +3183,23 @@ export const register: Register = (on, options) => {
       const fields = picked?.fields ?? []
       // The fields' names in one column, as wide as the longest up to a third.
       const named = Math.min(Math.floor(room / 3), Math.max(0, ...fields.map(([name]) => cells(name)))) + 1
+      // Of a used item, the tokens it took, counted as it is drawn.
+      const costs = picked === null ? [] : (items.find(one => keyOf(one) === picked.key)?.costs ?? [])
+      const costNamed = Math.max(0, ...costs.map(([name]) => cells(name))) + 1
 
       return (
         <Box flexDirection="column">
           {top(picked === null ? '세부 내용' : `세부 내용 · ${fit(picked.title ?? '', room - 12, 'end')}`)}
           {picked === null && row(<Text dimColor>위에서 항목을 선택하세요.</Text>)}
+          {costs.map(([name, value]) =>
+            row(
+              <Box>
+                <Text dimColor>{pad(name, costNamed)}</Text>
+                <Text color="yellow">{value}</Text>
+              </Box>,
+            ),
+          )}
+          {costs.length > 0 && <Text> </Text>}
           {wrap(picked?.path ?? '', room)
             .filter(line => line !== '')
             .map(line => row(<Text dimColor>{line}</Text>))}
@@ -2392,11 +3276,13 @@ export const register: Register = (on, options) => {
           if (id === HARNESS_TAB) {
             harness = await readHarness($).catch(() => harness)
             await refresh($, false).catch(() => undefined)
+            void countStanding($).catch(() => undefined)
           }
 
           // And the project's files each time theirs is.
           if (id === FILES_TAB) {
             await readProject($).catch(() => undefined)
+            await rereadChanges($).catch(() => undefined)
           }
 
           // The news shown is read when its tab is opened, unless it is fresh.
@@ -2404,14 +3290,16 @@ export const register: Register = (on, options) => {
             void readFeed($, newsAt.source, false).catch(() => undefined)
           }
 
-          // And the documentation's index, and the page that was open, when theirs is.
-          if (id === DOCS_TAB) {
-            void readDocIndex($, false).catch(() => undefined)
-
-            if (docAt.picked !== '') {
-              void readDocPage($, docAt.picked, false).catch(() => undefined)
-            }
+          // And what the Claude tab's part shows when its is.
+          if (id === CLAUDE_TAB) {
+            void readClaudePart($, claudeAt, docAt.picked)
           }
+
+          // The context is read again each time its tab is opened.
+          if (id === CONTEXT_TAB) {
+            void readContext($).catch(() => undefined)
+          }
+
         })}
         {isFirst && (
           <Box flexDirection="column">
@@ -2501,15 +3389,38 @@ export const register: Register = (on, options) => {
             <Text> </Text>
             {faceGap < 0 && row(<Text bold color="cyan">{clock}</Text>)}
             {faceGap >= 0 &&
-              [0, 1, 2].map(line =>
-                row(
+              [0, 1, 2].map(line => {
+                // The label on the first row, the time left on the second.
+                const beside = (side: (typeof sides)[number] | undefined) =>
+                  !isBeside || side === undefined || line === 2
+                    ? null
+                    : line === 0
+                      ? { text: side.label, color: undefined }
+                      : { text: side.value, color: side.color }
+                const left = beside(leftSide)
+                const right = beside(rightSide)
+
+                return row(
                   <Box>
-                    <Text>{' '.repeat(faceGap)}</Text>
+                    <Text>{' '.repeat(faceGap - (left === null ? 0 : cells(left.text) + 2))}</Text>
+                    {left !== null && <Text color={left.color} dimColor={left.color === undefined}>{left.text}  </Text>}
                     <Text bold color="cyan">{hours[line]}</Text>
                     <Text dimColor> {COLON[line]} </Text>
                     <Text bold color={BRIGHT_BLUE}>{minutes[line]}</Text>
+                    {right !== null && <Text color={right.color} dimColor={right.color === undefined}>  {right.text}</Text>}
                   </Box>,
-                ),
+                )
+              })}
+            {!isBeside &&
+              row(
+                <Box>
+                  <Text>{' '.repeat(Math.max(0, Math.floor((room - cells(belowText)) / 2)))}</Text>
+                  {sides.flatMap((one, index) => [
+                    ...(index > 0 ? [<Text dimColor> · </Text>] : []),
+                    <Text dimColor>{one.label} </Text>,
+                    <Text color={one.color}>{one.value}</Text>,
+                  ])}
+                </Box>,
               )}
             {row(
               <Text dimColor>
@@ -2656,8 +3567,10 @@ export const register: Register = (on, options) => {
                   // A repository's words go in a second row, dim.
                   const words = source.isTrending === true ? one.summary || '(설명 없음)' : null
 
+                  // A blank row sets each repository apart from the one above.
                   return (
                     <Box flexDirection="column">
+                      {index > 0 && words !== null && <Text> </Text>}
                       {row(
                         <Box>
                           <Text color="cyan">{one.link === newsAt.picked ? '› ' : '  '}</Text>
@@ -2727,21 +3640,11 @@ export const register: Register = (on, options) => {
                 {picked === undefined && row(<Text dimColor>위에서 기사를 고르세요.</Text>)}
                 {picked !== undefined &&
                   (() => {
-                    const summary = wrapWords(picked.summary, room)
-
+                    // The buttons come right under the title, so a long summary
+                    // does not push them out of sight.
                     return (
                       <Box flexDirection="column">
                         {wrapWords(picked.title, room).map(line => row(<Text bold>{line}</Text>))}
-                        {picked.summary !== '' &&
-                          summary
-                            .slice(0, SUMMARY_ROWS)
-                            .map((line, index) =>
-                              row(
-                                <Text dimColor>
-                                  {index === SUMMARY_ROWS - 1 && summary.length > SUMMARY_ROWS ? fit(`${line}…`, room, 'start') : line}
-                                </Text>,
-                              ),
-                            )}
                         {row(
                           <Box>
                             <Button
@@ -2770,13 +3673,219 @@ export const register: Register = (on, options) => {
                             <Text dimColor> {fit(hostOf(picked.link), room - cells(OPEN) - cells(SEND) - 2, 'start')}</Text>
                           </Box>,
                         )}
+                        {picked.summary !== '' && wrapWords(picked.summary, room).map(line => row(<Text dimColor>{line}</Text>))}
                       </Box>
                     )
                   })()}
               </Box>
             )
           })()}
-        {shown === DOCS_TAB &&
+        {shown === CLAUDE_TAB &&
+          bar('claude', CLAUDE_PARTS, claudeAt, async id => {
+            await update($, tab, () => CLAUDE_TAB)
+            await update($, claudePart, () => id)
+            void readClaudePart($, id, docAt.picked)
+          })}
+        {shown === CLAUDE_TAB &&
+          claudeAt === RELEASE_PART &&
+          (() => {
+            const releases = notes?.releases ?? []
+            const pages = Math.max(1, Math.ceil(releases.length / RELEASE_ROWS))
+            const at = Math.min(releaseAt.page, pages - 1)
+            const installed = /^\d+\.\d+\.\d+/.exec(now.version)?.[0] ?? ''
+            // Until one is picked, the release installed, or the latest.
+            const picked =
+              releases.find(one => one.version === releaseAt.picked) ??
+              releases.find(one => one.version === installed) ??
+              releases[0]
+            const readAt = notes === null || notes.readAt === 0 ? null : new Date(notes.readAt)
+            const isOpen = (group: ReleaseGroup) => !FOLDED.includes(group.kind) || releaseAt.opened.includes(group.kind)
+            // The picked release's changes in rows: a heading over each group,
+            // a folded one a button, and each change, where code is still in
+            // backticks; `isCode` is whether a row starts inside code.
+            const changeRows = (picked?.groups ?? []).flatMap((group, index) => {
+              const heads =
+                group.kind === ''
+                  ? []
+                  : [
+                      ...(index > 0 ? [{ tone: 'gap' as const, text: '', isCode: false }] : []),
+                      {
+                        tone: FOLDED.includes(group.kind) ? ('fold' as const) : ('head' as const),
+                        text: FOLDED.includes(group.kind)
+                          ? `${group.kind} ${group.items.length}개 ${isOpen(group) ? '▾' : '▸'}`
+                          : `${group.kind} ${group.items.length}`,
+                        kind: group.kind,
+                        isCode: false,
+                      },
+                    ]
+              const changes = !isOpen(group)
+                ? []
+                : group.items.flatMap(item => {
+                    let isCode = false
+
+                    return wrapWords(item, room - 2).map((line, n) => {
+                      const made = { tone: n === 0 ? ('first' as const) : ('more' as const), text: line, isCode }
+                      isCode = isCode !== (line.split('`').length % 2 === 0)
+
+                      return made
+                    })
+                  })
+
+              return [...heads, ...changes]
+            })
+            const detailPages = Math.max(1, Math.ceil(changeRows.length / DETAIL_ROWS))
+            const detailAt = Math.min(releaseAt.detailPage, detailPages - 1)
+            const pager = (prefix: string, place: number, count: number, go: (page: number) => Promise<unknown>, end?: RenderChildren) => (
+              <Box>
+                {place === 0 ? (
+                  <Text dimColor>◂ 이전</Text>
+                ) : (
+                  <Button key={`${prefix}-prev`} plain label="◂ 이전" onPress={() => go(place - 1)} />
+                )}
+                <Text dimColor>{`  ${place + 1}/${count}  `}</Text>
+                {place === count - 1 ? (
+                  <Text dimColor>다음 ▸</Text>
+                ) : (
+                  <Button key={`${prefix}-next`} plain label="다음 ▸" onPress={() => go(place + 1)} />
+                )}
+                {end}
+              </Box>
+            )
+            // Code in a row of a change, its backticks left out.
+            const coded = (line: string, isCode: boolean) =>
+              line
+                .split('`')
+                .map((piece, index) => (piece === '' ? null : <Text color={(index % 2 === 1) !== isCode ? 'magenta' : undefined}>{piece}</Text>))
+
+            // A changelog not yet read, as when the pane opens on this tab.
+            if (notes === null) {
+              void readChangelog($, false).catch(() => undefined)
+            }
+
+            return (
+              <Box flexDirection="column">
+                {top(
+                  readAt === null
+                    ? 'Claude Code 변경 내역'
+                    : `Claude Code 변경 내역 · ${releases.length}개 · ${two(readAt.getHours())}:${two(readAt.getMinutes())} 읽음`,
+                )}
+                {notes === null && row(<Text dimColor>변경 내역을 읽는 중입니다.</Text>)}
+                {notes !== null && notes.error !== '' && row(<Text color="red">{fit(notes.error, room, 'start')}</Text>)}
+                {releases.slice(at * RELEASE_ROWS, (at + 1) * RELEASE_ROWS).map(one => {
+                  const mark = one.version === installed ? '설치됨' : ''
+                  const space = room - 2 - VERSION_CELLS - (mark === '' ? 0 : cells(mark) + 1)
+                  // Closer together where the room is short, rather than cut.
+                  const counts = cells(countsOf(one)) <= space ? countsOf(one) : countsOf(one, ' ')
+
+                  return row(
+                    <Box>
+                      <Text color="cyan">{one.version === picked?.version ? '› ' : '  '}</Text>
+                      <Button
+                        key={`release-${one.version}`}
+                        plain
+                        label={pad(one.version, VERSION_CELLS)}
+                        onPress={() =>
+                          update($, releaseView, held => ({ ...NO_RELEASE_VIEW, ...held, picked: one.version, detailPage: 0, opened: [] }))
+                        }
+                      />
+                      <Text dimColor>{pad(fit(counts, space, 'start'), space)}</Text>
+                      {mark !== '' && <Text color="yellow"> {mark}</Text>}
+                    </Box>,
+                  )
+                })}
+                {row(
+                  pager(
+                    'release',
+                    at,
+                    pages,
+                    place => update($, releaseView, held => ({ ...NO_RELEASE_VIEW, ...held, page: place })),
+                    <Box>
+                      <Text>{' '.repeat(Math.max(1, room - cells(`◂ 이전  ${at + 1}/${pages}  다음 ▸`) - cells('새로고침')))}</Text>
+                      <Button
+                        key="release-refresh"
+                        plain
+                        label="새로고침"
+                        onPress={() => void readChangelog($, true).catch(() => undefined)}
+                      />
+                    </Box>,
+                  ),
+                )}
+                {top(
+                  picked === undefined
+                    ? '세부 내용'
+                    : `세부 내용 · ${picked.version} · ${picked.groups.reduce((sum, one) => sum + one.items.length, 0)}개`,
+                )}
+                {picked === undefined && row(<Text dimColor>위에서 버전을 고르세요.</Text>)}
+                {picked !== undefined &&
+                  row(
+                    <Box>
+                      <Button
+                        key="release-open"
+                        plain
+                        label={OPEN}
+                        onPress={async () => {
+                          const opened = await $.process.run(['open', CHANGELOG_URL], { timeoutMs: 5000 }).catch(() => null)
+
+                          if (opened === null || opened.exitCode !== 0) {
+                            $.ui.toast(`변경 내역을 열지 못했습니다: ${hostOf(CHANGELOG_URL)}`)
+                          }
+                        }}
+                      />
+                      <Text dimColor> {hostOf(CHANGELOG_URL)}</Text>
+                    </Box>,
+                  )}
+                {picked !== undefined && <Text> </Text>}
+                {changeRows.slice(detailAt * DETAIL_ROWS, (detailAt + 1) * DETAIL_ROWS).map((one, index) => {
+                  if (one.tone === 'gap') {
+                    return index === 0 ? null : <Text> </Text>
+                  }
+
+                  if (one.tone === 'head') {
+                    return row(<Text bold color="cyan">{one.text}</Text>)
+                  }
+
+                  if (one.tone === 'fold') {
+                    return row(
+                      <Button
+                        key={`release-fold-${one.kind}`}
+                        plain
+                        label={one.text}
+                        onPress={() =>
+                          update($, releaseView, held => {
+                            const now = { ...NO_RELEASE_VIEW, ...held }
+
+                            return {
+                              ...now,
+                              opened: now.opened.includes(one.kind) ? now.opened.filter(kind => kind !== one.kind) : [...now.opened, one.kind],
+                            }
+                          })
+                        }
+                      >
+                        <Text bold color="cyan">
+                          {one.text}
+                        </Text>
+                      </Button>,
+                    )
+                  }
+
+                  return row(
+                    <Box>
+                      <Text dimColor>{one.tone === 'first' ? '· ' : '  '}</Text>
+                      {coded(one.text, one.isCode)}
+                    </Box>,
+                  )
+                })}
+                {detailPages > 1 &&
+                  row(
+                    pager('release-detail', detailAt, detailPages, place =>
+                      update($, releaseView, held => ({ ...NO_RELEASE_VIEW, ...held, detailPage: place })),
+                    ),
+                  )}
+              </Box>
+            )
+          })()}
+        {shown === CLAUDE_TAB &&
+          claudeAt === DOCS_PART &&
           (() => {
             const sections = docList?.sections ?? []
             const sectionAt = Math.min(docAt.section, Math.max(0, sections.length - 1))
@@ -2984,6 +4093,137 @@ export const register: Register = (on, options) => {
               </Box>
             )
           })()}
+        {shown === CONTEXT_TAB &&
+          (() => {
+            const part = PARTS.find(one => one.id === contextAt.part) ?? PARTS[0]
+            const entries = part?.id === 'prompt' ? (context?.sections ?? []) : (context?.messages ?? [])
+            const pages = Math.max(1, Math.ceil(entries.length / CONTEXT_ROWS))
+            const at = Math.min(contextAt.page, pages - 1)
+            const drawn = entries.slice(at * CONTEXT_ROWS, (at + 1) * CONTEXT_ROWS)
+            const picked = entries.find(one => one.name === contextAt.picked)
+            const readAt = contextGot === null || contextGot.readAt === 0 ? null : new Date(contextGot.readAt)
+            const toneOf = (one: ContextItem) => TONES[one.tone] ?? { label: one.tone }
+            const size = (chars: number) => `${tokens(chars)}자`
+            // The name, who wrote it and the size in columns of their own; the
+            // first words in what is left.
+            const named = Math.min(16, Math.max(0, ...drawn.map(one => cells(one.name))))
+            const toned = Math.max(0, ...drawn.map(one => cells(toneOf(one).label)))
+            const sized = Math.max(0, ...drawn.map(one => cells(size(one.chars))))
+            const space = Math.max(4, room - 2 - named - toned - 2 - sized - 1)
+            // The picked entry's blocks in rows: a heading over each, its words
+            // under a rule.
+            const blockRows = (picked?.blocks ?? []).flatMap((block, index) => [
+              ...(index > 0 ? [{ tone: 'gap' as const, text: '' }] : []),
+              { tone: 'head' as const, text: block.title },
+              ...(block.text === ''
+                ? []
+                : block.text.split('\n').flatMap(line => wrap(line, room - 2).map(text => ({ tone: 'line' as const, text })))),
+            ])
+            const detailPages = Math.max(1, Math.ceil(blockRows.length / DETAIL_ROWS))
+            const detailAt = Math.min(contextAt.detailPage, detailPages - 1)
+            const pager = (prefix: string, place: number, count: number, go: (page: number) => Promise<unknown>, end?: RenderChildren) => (
+              <Box>
+                {place === 0 ? (
+                  <Text dimColor>◂ 이전</Text>
+                ) : (
+                  <Button key={`${prefix}-prev`} plain label="◂ 이전" onPress={() => go(place - 1)} />
+                )}
+                <Text dimColor>{`  ${place + 1}/${count}  `}</Text>
+                {place === count - 1 ? (
+                  <Text dimColor>다음 ▸</Text>
+                ) : (
+                  <Button key={`${prefix}-next`} plain label="다음 ▸" onPress={() => go(place + 1)} />
+                )}
+                {end}
+              </Box>
+            )
+
+            // Entries not yet read, as when the pane opens on this tab or the
+            // module was loaded again.
+            if (context === null) {
+              void readContext($).catch(() => undefined)
+            }
+
+            return (
+              <Box flexDirection="column">
+                {bar('context', PARTS, part?.id ?? '', id =>
+                  update($, contextView, held => ({ ...NO_CONTEXT_VIEW, ...held, part: id, page: 0, picked: '', detailPage: 0 })),
+                )}
+                {top(
+                  readAt === null
+                    ? (part?.label ?? '')
+                    : `${part?.label ?? ''} · ${entries.length}개 · ${size(entries.reduce((sum, one) => sum + one.chars, 0))} · ${two(readAt.getHours())}:${two(readAt.getMinutes())} 읽음`,
+                )}
+                {context === null && row(<Text dimColor>컨텍스트를 읽는 중입니다.</Text>)}
+                {contextGot !== null && contextGot.error !== '' && row(<Text color="red">{fit(contextGot.error, room, 'start')}</Text>)}
+                {context !== null && part?.id === 'messages' && row(<Text dimColor>최근 메시지부터 · 다음 요청에 보낼 내용</Text>)}
+                {context !== null && part?.id === 'prompt' && row(<Text dimColor>도구 정의는 상태 탭의 분류에서 봅니다.</Text>)}
+                {context !== null && entries.length === 0 && row(<Text dimColor>아직 없습니다.</Text>)}
+                {drawn.map(one => {
+                  const tone = toneOf(one)
+
+                  return row(
+                    <Box>
+                      <Text color="cyan">{one.name === picked?.name ? '› ' : '  '}</Text>
+                      <Button
+                        key={`context-item-${one.name}`}
+                        plain
+                        label={one.name}
+                        onPress={() => update($, contextView, held => ({ ...NO_CONTEXT_VIEW, ...held, picked: one.name, detailPage: 0 }))}
+                      >
+                        <Text>{pad(fit(one.name, named, 'start'), named)} </Text>
+                        <Text color={tone.color} dimColor={tone.color === undefined}>
+                          {pad(tone.label, toned)}{' '}
+                        </Text>
+                        <Text dimColor>{pad(fit(one.preview, space, 'start'), space)} </Text>
+                        <Text dimColor>{size(one.chars).padStart(sized)}</Text>
+                      </Button>
+                    </Box>,
+                  )
+                })}
+                {row(
+                  pager(
+                    'context',
+                    at,
+                    pages,
+                    place => update($, contextView, held => ({ ...NO_CONTEXT_VIEW, ...held, page: place })),
+                    <Box>
+                      <Text>{' '.repeat(Math.max(1, room - cells(`◂ 이전  ${at + 1}/${pages}  다음 ▸`) - cells('새로고침')))}</Text>
+                      <Button key="context-refresh" plain label="새로고침" onPress={() => void readContext($).catch(() => undefined)} />
+                    </Box>,
+                  ),
+                )}
+                {top(
+                  picked === undefined
+                    ? '세부 내용'
+                    : `세부 내용 · ${picked.name} ${toneOf(picked).label} · 블록 ${picked.blocks.length}개`,
+                )}
+                {picked === undefined && row(<Text dimColor>위에서 항목을 고르세요.</Text>)}
+                {blockRows.slice(detailAt * DETAIL_ROWS, (detailAt + 1) * DETAIL_ROWS).map((one, index) => {
+                  if (one.tone === 'gap') {
+                    return index === 0 ? null : <Text> </Text>
+                  }
+
+                  if (one.tone === 'head') {
+                    return row(<Text bold color="cyan">{fit(one.text, room, 'start')}</Text>)
+                  }
+
+                  return row(
+                    <Box>
+                      <Text dimColor>│ </Text>
+                      <Text>{one.text}</Text>
+                    </Box>,
+                  )
+                })}
+                {detailPages > 1 &&
+                  row(
+                    pager('context-detail', detailAt, detailPages, place =>
+                      update($, contextView, held => ({ ...NO_CONTEXT_VIEW, ...held, detailPage: place })),
+                    ),
+                  )}
+              </Box>
+            )
+          })()}
         {shown === FILES_TAB &&
           (() => {
             const rows = fileRows(project?.paths ?? [], marks, view)
@@ -2992,6 +4232,145 @@ export const register: Register = (on, options) => {
             const done = marks[view.picked] ?? []
             const isGone = done[done.length - 1]?.op === 'D'
             const picked = view.picked
+            const isDiff = view.filter === 'diff'
+            // Pages of a list: the one shown, and buttons to the one before and after.
+            const pager = (shownPage: number, all: number, prefix: string) =>
+              all > 1 &&
+              row(
+                <Box>
+                  {shownPage === 0 ? (
+                    <Text dimColor>◂ 이전</Text>
+                  ) : (
+                    <Button
+                      key={`${prefix}-prev`}
+                      plain
+                      label="◂ 이전"
+                      onPress={() => update($, fileView, now => ({ ...NO_VIEW, ...now, page: shownPage - 1 }))}
+                    />
+                  )}
+                  <Text dimColor>{`  ${shownPage + 1}/${all}  `}</Text>
+                  {shownPage === all - 1 ? (
+                    <Text dimColor>다음 ▸</Text>
+                  ) : (
+                    <Button
+                      key={`${prefix}-next`}
+                      plain
+                      label="다음 ▸"
+                      onPress={() => update($, fileView, now => ({ ...NO_VIEW, ...now, page: shownPage + 1 }))}
+                    />
+                  )}
+                </Box>,
+              )
+            // Git's changes against HEAD: the files, each with its lines added
+            // and removed, and the hunks of the one picked.
+            const changeView = () => {
+              const list = changed?.files ?? []
+              const diffPages = Math.max(1, Math.ceil(list.length / FILE_ROWS))
+              const diffAt = Math.min(view.page, diffPages - 1)
+              const listed = list.slice(diffAt * FILE_ROWS, (diffAt + 1) * FILE_ROWS)
+              const countOf = (one: Change) =>
+                one.added === undefined ? null : { plus: `+${one.added}`, minus: `-${one.removed ?? 0}` }
+              const sizeOf = (one: Change) => {
+                const count = countOf(one)
+
+                return count === null ? 0 : cells(count.plus) + 1 + cells(count.minus)
+              }
+              const widest = Math.max(0, ...listed.map(sizeOf))
+              const space = room - 2 - (widest + 3)
+              const added = list.reduce((sum, one) => sum + (one.added ?? 0), 0)
+              const removed = list.reduce((sum, one) => sum + (one.removed ?? 0), 0)
+              const chosen = list.find(one => one.path === picked)
+
+              return (
+                <Box flexDirection="column">
+                  {changed === null && row(<Text dimColor>변경 사항을 읽는 중입니다.</Text>)}
+                  {changed !== null &&
+                    changed.error === '' &&
+                    row(
+                      <Box>
+                        <Text dimColor>{`${list.length}개 `}</Text>
+                        <Text color="green">+{added}</Text>
+                        <Text> </Text>
+                        <Text color="red">-{removed}</Text>
+                        <Text>{' '.repeat(Math.max(1, room - 4 - cells(`${list.length}개 +${added} -${removed}`) - cells(RELOAD)))}</Text>
+                        <Button key="changes-reload" plain label={RELOAD} onPress={() => readChanges($)} />
+                      </Box>,
+                    )}
+                  {changed !== null && changed.error !== '' && row(<Text dimColor>{changed.error}</Text>)}
+                  {changed !== null && changed.error === '' && list.length === 0 && row(<Text dimColor>바뀐 파일이 없습니다.</Text>)}
+                  {listed.map(one => {
+                    const count = countOf(one)
+
+                    return row(
+                      <Box>
+                        <Text color="cyan">{one.path === picked ? '› ' : '  '}</Text>
+                        <Button
+                          key={`change-${one.path}`}
+                          plain
+                          dimColor={one.op === 'D'}
+                          label={pad(fit(one.path, space, 'start'), space)}
+                          onPress={async () => {
+                            const isOff = picked === one.path
+                            await update($, fileView, now => ({ ...NO_VIEW, ...now, picked: isOff ? '' : one.path }))
+
+                            if (!isOff) {
+                              await readHunks($, one)
+                            }
+                          }}
+                        />
+                        <Text>{' '.repeat(1 + widest - sizeOf(one))}</Text>
+                        {count !== null && <Text color="green">{count.plus}</Text>}
+                        {count !== null && <Text> </Text>}
+                        {count !== null && <Text color="red">{count.minus}</Text>}
+                        <Text> </Text>
+                        <Text bold color={OP_COLORS[one.op]}>
+                          {one.op}
+                        </Text>
+                      </Box>,
+                    )
+                  })}
+                  {pager(diffAt, diffPages, 'changes')}
+                  {top(
+                    chosen === undefined
+                      ? '세부 내용'
+                      : `세부 내용 · ${fit(chosen.path.slice(chosen.path.lastIndexOf('/') + 1), room - 12, 'end')}`,
+                  )}
+                  {chosen === undefined && row(<Text dimColor>위에서 파일을 선택하세요.</Text>)}
+                  {chosen !== undefined && wrap(chosen.path, room).map(line => row(<Text dimColor>{line}</Text>))}
+                  {chosen !== undefined &&
+                    chosen.op !== 'D' &&
+                    project !== null &&
+                    row(
+                      <Button
+                        key="change-open"
+                        plain
+                        label={OPEN}
+                        onPress={() =>
+                          openFile(
+                            $,
+                            { name: chosen.path.slice(chosen.path.lastIndexOf('/') + 1), path: `${project.root}/${chosen.path}` },
+                            app,
+                          )
+                        }
+                      />,
+                    )}
+                  {chosen !== undefined && diffed?.path !== chosen.path && row(<Text dimColor>차이를 읽는 중입니다.</Text>)}
+                  {chosen !== undefined &&
+                    diffed?.path === chosen.path &&
+                    diffed.text === '' &&
+                    row(<Text dimColor>보여 줄 줄이 없습니다. 바이너리 파일일 수 있습니다.</Text>)}
+                  {chosen !== undefined && diffed?.path === chosen.path && diffed.text !== '' && (
+                    <Box paddingLeft={2} width={width}>
+                      <Code source={diffed.text} format="diff" path={chosen.path} />
+                    </Box>
+                  )}
+                  {chosen !== undefined &&
+                    diffed?.path === chosen.path &&
+                    diffed.cut > 0 &&
+                    row(<Text dimColor>… 외 {diffed.cut}줄</Text>)}
+                </Box>
+              )
+            }
 
             return (
               <Box flexDirection="column">
@@ -3003,114 +4382,101 @@ export const register: Register = (on, options) => {
                   [
                     { id: 'all', label: '전체' },
                     { id: 'touched', label: '손댄 것만' },
+                    { id: 'diff', label: '바뀐 것' },
                   ],
-                  view.filter === 'touched' ? 'touched' : 'all',
-                  id => update($, fileView, now => ({ ...NO_VIEW, ...now, filter: id, page: 0 })),
-                )}
-                {project !== null && rows.length === 0 && row(<Text dimColor>표시할 파일이 없습니다.</Text>)}
-                {rows.slice(at * FILE_ROWS, (at + 1) * FILE_ROWS).map(one => {
-                  const indent = Math.min(INDENT_FILES, one.depth * 2)
-                  const space = room - indent - 2 - (OPS.length + 1)
-                  const last = marks[one.path]?.[(marks[one.path]?.length ?? 0) - 1]
+                  view.filter === 'touched' || isDiff ? view.filter : 'all',
+                  async id => {
+                    await update($, fileView, now => ({ ...NO_VIEW, ...now, filter: id, page: 0 }))
 
-                  return row(
-                    <Box>
-                      <Text color="cyan">
-                        {' '.repeat(indent)}
-                        {one.isDir ? (one.isOpen ? '▾ ' : '▸ ') : one.path === picked ? '› ' : '  '}
-                      </Text>
-                      <Button
-                        key={`${one.isDir ? 'dir' : 'file'}-${one.path}`}
-                        plain
-                        dimColor={!one.isDir && last?.op === 'D'}
-                        label={pad(fit(one.name, space, 'start'), space)}
-                        onPress={() =>
-                          update($, fileView, now => {
-                            const held = { ...NO_VIEW, ...now }
-
-                            return one.isDir
-                              ? {
-                                  ...held,
-                                  open: held.open.includes(one.path)
-                                    ? held.open.filter(each => each !== one.path)
-                                    : [...held.open, one.path],
-                                }
-                              : { ...held, picked: held.picked === one.path ? '' : one.path }
-                          })
-                        }
-                      />
-                      <Text>{' '.repeat(OPS.length + 1 - one.ops.length)}</Text>
-                      {one.ops.map(op => (
-                        <Text bold color={OP_COLORS[op]}>
-                          {op}
-                        </Text>
-                      ))}
-                    </Box>,
-                  )
-                })}
-                {pages > 1 &&
-                  row(
-                    <Box>
-                      {at === 0 ? (
-                        <Text dimColor>◂ 이전</Text>
-                      ) : (
-                        <Button
-                          key="files-prev"
-                          plain
-                          label="◂ 이전"
-                          onPress={() => update($, fileView, now => ({ ...NO_VIEW, ...now, page: at - 1 }))}
-                        />
-                      )}
-                      <Text dimColor>{`  ${at + 1}/${pages}  `}</Text>
-                      {at === pages - 1 ? (
-                        <Text dimColor>다음 ▸</Text>
-                      ) : (
-                        <Button
-                          key="files-next"
-                          plain
-                          label="다음 ▸"
-                          onPress={() => update($, fileView, now => ({ ...NO_VIEW, ...now, page: at + 1 }))}
-                        />
-                      )}
-                    </Box>,
-                  )}
-                {top(
-                  picked === ''
-                    ? '세부 내용'
-                    : `세부 내용 · ${fit(picked.slice(picked.lastIndexOf('/') + 1), room - 12, 'end')}`,
+                    if (id === 'diff') {
+                      await rereadChanges($)
+                    }
+                  },
                 )}
-                {picked === '' && row(<Text dimColor>위에서 파일을 선택하세요.</Text>)}
-                {picked !== '' && wrap(picked, room).map(line => row(<Text dimColor>{line}</Text>))}
-                {picked !== '' &&
-                  !isGone &&
-                  project !== null &&
-                  row(
-                    <Button
-                      key="file-open"
-                      plain
-                      label={OPEN}
-                      onPress={() =>
-                        openFile($, { name: picked.slice(picked.lastIndexOf('/') + 1), path: `${project.root}/${picked}` }, app)
-                      }
-                    />,
-                  )}
-                {picked !== '' && done.length === 0 && row(<Text dimColor>에이전트가 손대지 않은 파일입니다.</Text>)}
-                {picked !== '' &&
-                  done.map(one => {
-                    const when = new Date(one.at)
+                {isDiff && changeView()}
+                {!isDiff && (
+                  <Box flexDirection="column">
+                  {project !== null && rows.length === 0 && row(<Text dimColor>표시할 파일이 없습니다.</Text>)}
+                  {rows.slice(at * FILE_ROWS, (at + 1) * FILE_ROWS).map(one => {
+                    const indent = Math.min(INDENT_FILES, one.depth * 2)
+                    const space = room - indent - 2 - (OPS.length + 1)
+                    const last = marks[one.path]?.[(marks[one.path]?.length ?? 0) - 1]
 
                     return row(
                       <Box>
-                        <Text dimColor>
-                          {two(when.getHours())}:{two(when.getMinutes())}{' '}
+                        <Text color="cyan">
+                          {' '.repeat(indent)}
+                          {one.isDir ? (one.isOpen ? '▾ ' : '▸ ') : one.path === picked ? '› ' : '  '}
                         </Text>
-                        <Text bold color={OP_COLORS[one.op]}>
-                          {one.op}
-                        </Text>
-                        <Text> {one.tool}</Text>
+                        <Button
+                          key={`${one.isDir ? 'dir' : 'file'}-${one.path}`}
+                          plain
+                          dimColor={!one.isDir && last?.op === 'D'}
+                          label={pad(fit(one.name, space, 'start'), space)}
+                          onPress={() =>
+                            update($, fileView, now => {
+                              const held = { ...NO_VIEW, ...now }
+
+                              return one.isDir
+                                ? {
+                                    ...held,
+                                    open: held.open.includes(one.path)
+                                      ? held.open.filter(each => each !== one.path)
+                                      : [...held.open, one.path],
+                                  }
+                                : { ...held, picked: held.picked === one.path ? '' : one.path }
+                            })
+                          }
+                        />
+                        <Text>{' '.repeat(OPS.length + 1 - one.ops.length)}</Text>
+                        {one.ops.map(op => (
+                          <Text bold color={OP_COLORS[op]}>
+                            {op}
+                          </Text>
+                        ))}
                       </Box>,
                     )
                   })}
+                  {pager(at, pages, 'files')}
+                  {top(
+                    picked === ''
+                      ? '세부 내용'
+                      : `세부 내용 · ${fit(picked.slice(picked.lastIndexOf('/') + 1), room - 12, 'end')}`,
+                  )}
+                  {picked === '' && row(<Text dimColor>위에서 파일을 선택하세요.</Text>)}
+                  {picked !== '' && wrap(picked, room).map(line => row(<Text dimColor>{line}</Text>))}
+                  {picked !== '' &&
+                    !isGone &&
+                    project !== null &&
+                    row(
+                      <Button
+                        key="file-open"
+                        plain
+                        label={OPEN}
+                        onPress={() =>
+                          openFile($, { name: picked.slice(picked.lastIndexOf('/') + 1), path: `${project.root}/${picked}` }, app)
+                        }
+                      />,
+                    )}
+                  {picked !== '' && done.length === 0 && row(<Text dimColor>에이전트가 손대지 않은 파일입니다.</Text>)}
+                  {picked !== '' &&
+                    done.map(one => {
+                      const when = new Date(one.at)
+
+                      return row(
+                        <Box>
+                          <Text dimColor>
+                            {two(when.getHours())}:{two(when.getMinutes())}{' '}
+                          </Text>
+                          <Text bold color={OP_COLORS[one.op]}>
+                            {one.op}
+                          </Text>
+                          <Text> {one.tool}</Text>
+                        </Box>,
+                      )
+                    })}
+                  </Box>
+                )}
               </Box>
             )
           })()}
@@ -3192,7 +4558,7 @@ export const register: Register = (on, options) => {
               },
               id => isUsedIn(area.id, id),
             )}
-            {top(`${section.title} · ${area.label} ${own.length}`)}
+            {top(`${section.title} · ${area.label} ${own.length}${took > 0 ? ` · ${tokens(took)}` : ''}`)}
             {area.id !== 'used' && now.harness === null && row(<Text dimColor>하네스 정보를 읽지 못했습니다.</Text>)}
             {area.id !== 'used' && now.harness !== null && own.length === 0 && row(<Text dimColor>항목이 없습니다.</Text>)}
             {area.id === 'used' && items.length === 0 && row(<Text dimColor>이 세션에서 사용된 항목이 없습니다.</Text>)}
